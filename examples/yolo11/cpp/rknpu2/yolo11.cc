@@ -46,11 +46,20 @@ int init_yolo11_model(const char *model_path, rknn_app_context_t *app_ctx)
         return -1;
     }
 
-    ret = rknn_init(&ctx, model, model_len, 0, NULL);
+    // Change the '0' flag to RKNN_FLAG_ENABLE_SRAM to use high-speed internal memory
+    ret = rknn_init(&ctx, model, model_len, RKNN_FLAG_ENABLE_SRAM, NULL);
     free(model);
     if (ret < 0)
     {
         printf("rknn_init fail! ret=%d\n", ret);
+        return -1;
+    }
+
+    // FORCE WORKLOAD TO SHARE ALL 3 CORES SIMULTANEOUSLY (6 TOPS mode)
+    ret = rknn_set_core_mask(ctx, RKNN_NPU_CORE_0_1_2);
+    if (ret < 0)
+    {
+        printf("rknn_set_core_mask fail! ret=%d\n", ret);
         return -1;
     }
 

@@ -1,24 +1,10 @@
 // Copyright (c) 2024 by Rockchip Electronics Co., Ltd. All Rights Reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
-/*-------------------------------------------
-                Includes
--------------------------------------------*/
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h> // Correctly included for gettimeofday
 
 #include "yolo11.h"
 #include "image_utils.h"
@@ -29,9 +15,6 @@
     #include "dma_alloc.hpp"
 #endif
 
-/*-------------------------------------------
-                  Main Function
--------------------------------------------*/
 int main(int argc, char **argv)
 {
     if (argc != 3)
@@ -61,7 +44,6 @@ int main(int argc, char **argv)
     ret = read_image(image_path, &src_image);
 
 #if defined(RV1106_1103) 
-    //RV1106 rga requires that input and output bufs are memory allocated by dma
     ret = dma_buf_alloc(RV1106_CMA_HEAP_PATH, src_image.size, &rknn_app_ctx.img_dma_buf.dma_buf_fd, 
                        (void **) & (rknn_app_ctx.img_dma_buf.dma_buf_virt_addr));
     memcpy(rknn_app_ctx.img_dma_buf.dma_buf_virt_addr, src_image.virt_addr, src_image.size);
@@ -80,11 +62,44 @@ int main(int argc, char **argv)
 
     object_detect_result_list od_results;
 
+    // --- WARM UP RUN ---
     ret = inference_yolo11_model(&rknn_app_ctx, &src_image, &od_results);
     if (ret != 0)
     {
-        printf("init_yolo11_model fail! ret=%d\n", ret);
+        printf("inference_yolo11_model fail! ret=%d\n", ret);
         goto out;
+    }
+
+    // --- DUAL BENCHMARK SCOPE ---
+    {
+        int loop_count = 100;
+        struct timeval start_time, stop_time;
+        
+        // 1. Measure the COMPLETE Pipeline (Pre + Inference + Post)
+        gettimeofday(&start_time, NULL);
+        for (int i = 0; i < loop_count; ++i) {
+            inference_yolo11_model(&rknn_app_ctx, &src_image, &od_results);
+        }
+        gettimeofday(&stop_time, NULL);
+        double total_time_ms = (stop_time.tv_sec - start_time.tv_sec) * 1000.0 + 
+                               (stop_time.tv_usec - start_time.tv_usec) / 1000.0;
+        
+        // 2. Measure ONLY the Core Hardware NPU Execution
+        struct timeval npu_start, npu_stop;
+        gettimeofday(&npu_start, NULL);
+        for (int i = 0; i < loop_count; ++i) {
+            // Directly invokes the low-level runtime driver on the current memory buffer
+            rknn_run(rknn_app_ctx.rknn_ctx, NULL);
+        }
+        gettimeofday(&npu_stop, NULL);
+        double npu_time_ms = (npu_stop.tv_sec - npu_start.tv_sec) * 1000.0 + 
+                             (npu_stop.tv_usec - npu_start.tv_usec) / 1000.0;
+        
+        printf("\n=======================================\n");
+        printf("Official RKNN Zoo Benchmark (%d loops):\n", loop_count);
+        printf("End-to-End Pipeline    : %.2f ms (%.1f FPS)\n", total_time_ms / loop_count, 1000.0 / (total_time_ms / loop_count));
+        printf("Pure NPU Inference Only: %.2f ms (%.1f FPS)\n", npu_time_ms / loop_count, 1000.0 / (npu_time_ms / loop_count));
+        printf("=======================================\n\n");
     }
 
     // 画框和概率
@@ -92,17 +107,12 @@ int main(int argc, char **argv)
     for (int i = 0; i < od_results.count; i++)
     {
         object_detect_result *det_result = &(od_results.results[i]);
-        printf("%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det_result->cls_id),
-               det_result->box.left, det_result->box.top,
-               det_result->box.right, det_result->box.bottom,
-               det_result->prop);
         int x1 = det_result->box.left;
         int y1 = det_result->box.top;
         int x2 = det_result->box.right;
         int y2 = det_result->box.bottom;
 
         draw_rectangle(&src_image, x1, y1, x2 - x1, y2 - y1, COLOR_BLUE, 3);
-
         sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
         draw_text(&src_image, text, x1, y1 - 20, COLOR_RED, 10);
     }
