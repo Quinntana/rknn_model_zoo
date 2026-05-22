@@ -22,6 +22,11 @@
 #include "file_utils.h"
 #include "image_utils.h"
 
+// =========================================================================
+// !!! OPTIMIZATION CHANGE: Persistent Preprocessing Memory Pool !!!
+// =========================================================================
+static unsigned char* g_preprocess_buf = NULL;
+
 static void dump_tensor_attr(rknn_tensor_attr *attr)
 {
     printf("  index=%d, name=%s, n_dims=%d, dims=[%d, %d, %d, %d], n_elems=%d, size=%d, fmt=%s, type=%s, qnt_type=%s, "
@@ -141,6 +146,17 @@ int init_yolo11_model(const char *model_path, rknn_app_context_t *app_ctx)
     printf("model input height=%d, width=%d, channel=%d\n",
            app_ctx->model_height, app_ctx->model_width, app_ctx->model_channel);
 
+    // =========================================================================
+    // !!! OPTIMIZATION CHANGE: Allocate the Persistent Buffer ONCE here !!!
+    // =========================================================================
+    int buffer_size = app_ctx->model_width * app_ctx->model_height * app_ctx->model_channel;
+    g_preprocess_buf = (unsigned char *)malloc(buffer_size);
+    if (g_preprocess_buf == NULL)
+    {
+        printf("Global preprocess buffer allocation fail!\n");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -161,6 +177,16 @@ int release_yolo11_model(rknn_app_context_t *app_ctx)
         rknn_destroy(app_ctx->rknn_ctx);
         app_ctx->rknn_ctx = 0;
     }
+
+    // =========================================================================
+    // !!! OPTIMIZATION CHANGE: Free the Persistent Buffer ONCE on Shutdown !!!
+    // =========================================================================
+    if (g_preprocess_buf != NULL)
+    {
+        free(g_preprocess_buf);
+        g_preprocess_buf = NULL;
+    }
+
     return 0;
 }
 
@@ -191,12 +217,11 @@ int inference_yolo11_model(rknn_app_context_t *app_ctx, image_buffer_t *img, obj
     dst_img.height = app_ctx->model_height;
     dst_img.format = IMAGE_FORMAT_RGB888;
     dst_img.size = get_image_size(&dst_img);
-    dst_img.virt_addr = (unsigned char *)malloc(dst_img.size);
-    if (dst_img.virt_addr == NULL)
-    {
-        printf("malloc buffer size:%d fail!\n", dst_img.size);
-        return -1;
-    }
+    
+    // =========================================================================
+    // !!! OPTIMIZATION CHANGE: Swapped dynamic malloc for persistent pointer !!!
+    // =========================================================================
+    dst_img.virt_addr = g_preprocess_buf; 
 
     // letterbox
     ret = convert_image_with_letterbox(img, &dst_img, &letter_box, bg_color);
@@ -250,10 +275,10 @@ int inference_yolo11_model(rknn_app_context_t *app_ctx, image_buffer_t *img, obj
     rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
 
 out:
-    if (dst_img.virt_addr != NULL)
-    {
-        free(dst_img.virt_addr);
-    }
+    // =========================================================================
+    // !!! OPTIMIZATION CHANGE: Removed free() to keep memory buffer persistent !!!
+    // =========================================================================
+    // Dynamic frame-by-frame memory cleanup has been removed from this block.
 
     return ret;
 }
