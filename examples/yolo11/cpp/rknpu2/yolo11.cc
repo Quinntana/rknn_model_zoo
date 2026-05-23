@@ -60,14 +60,6 @@ int init_yolo11_model(const char *model_path, rknn_app_context_t *app_ctx)
         return -1;
     }
 
-    // FORCE WORKLOAD TO SHARE ALL 3 CORES SIMULTANEOUSLY (6 TOPS mode)
-    ret = rknn_set_core_mask(ctx, RKNN_NPU_CORE_0_1_2);
-    if (ret < 0)
-    {
-        printf("rknn_set_core_mask fail! ret=%d\n", ret);
-        return -1;
-    }
-
     // Get Model Input Output Number
     rknn_input_output_num io_num;
     ret = rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
