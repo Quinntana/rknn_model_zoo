@@ -5,130 +5,145 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
-#include <thread>  // Added for clean multi-threading
-#include <vector>  // Added to manage parallel thread arrays
+#include <string>
+
+// Include OpenCV
+#include <opencv2/opencv.hpp>
+#include <opencv2/videoio.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include "yolo11.h"
 #include "image_utils.h"
 #include "file_utils.h"
-#include "image_drawing.h"
+
+double get_current_time_ms() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
 
 int main(int argc, char **argv)
 {
-    if (argc != 3)
-    {
-        printf("%s <model_path> <image_path>\n", argv[0]);
+    if (argc != 3) {
+        printf("Usage: %s <model_path> <video_path>\n", argv[0]);
         return -1;
     }
 
     const char *model_path = argv[1];
-    const char *image_path = argv[2];
+    const char *video_path = argv[2];
     int ret;
 
+    rknn_app_context_t rknn_app_ctx;
+    memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
     init_post_process();
 
-    // 1. INITIALIZE 3 COMPLETELY INDEPENDENT CONTEXTS AND ASSIGN THEM TO STANDALONE CORES
-    rknn_app_context_t rknn_ctx_pool[3];
-    rknn_core_mask core_assignments[3] = {RKNN_NPU_CORE_0, RKNN_NPU_CORE_1, RKNN_NPU_CORE_2};
+    ret = init_yolo11_model(model_path, &rknn_app_ctx);
+    if (ret != 0) return -1;
+    
+    // Pin to Core 0
+    rknn_set_core_mask(rknn_app_ctx.rknn_ctx, RKNN_NPU_CORE_0);
 
-    for (int i = 0; i < 3; ++i)
-    {
-        memset(&rknn_ctx_pool[i], 0, sizeof(rknn_app_context_t));
-        ret = init_yolo11_model(model_path, &rknn_ctx_pool[i]);
-        if (ret != 0)
-        {
-            printf("init_yolo11_model context index %d fail!\n", i);
-            return -1;
-        }
-        // Explicitly map each distinct session handle directly to a specific physical 2-TOPS silicon core
-        ret = rknn_set_core_mask(rknn_ctx_pool[i].rknn_ctx, core_assignments[i]);
-        if (ret < 0) {
-            printf("rknn_set_core_mask for core %d failed!\n", i);
-            return -1;
-        }
-    }
+    std::string pipeline = "filesrc location=" + std::string(video_path) + 
+                           " ! qtdemux ! h264parse ! mppvideodec ! videoconvert ! video/x-raw,format=BGR ! appsink drop=true max-buffers=1";
 
-    // Load the target test image frame buffer
-    image_buffer_t src_image;
-    memset(&src_image, 0, sizeof(image_buffer_t));
-    ret = read_image(image_path, &src_image);
-    if (ret != 0)
-    {
-        printf("read image fail! ret=%d\n", ret);
+    cv::VideoCapture cap(pipeline, cv::CAP_GSTREAMER);
+    if (!cap.isOpened()) {
+        printf("Failed to open hardware video pipeline!\n");
         return -1;
     }
 
-    // Separate post-processing result structures to guarantee thread safety
-    object_detect_result_list od_results_pool[3];
+    // --- Initialize the Video Writer ---
+    int w = cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    int h = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+    cv::VideoWriter writer("output_hardware.mp4", cv::VideoWriter::fourcc('m', 'p', '4', 'v'), 30, cv::Size(w, h));
 
-    // Warm-up run across all three context models to lock internal buffers into active device space
-    for (int i = 0; i < 3; ++i) {
-        inference_yolo11_model(&rknn_ctx_pool[i], &src_image, &od_results_pool[i]);
-    }
+    cv::Mat bgr_frame, rgb_frame;
+    object_detect_result_list od_results;
+    int frame_count = 0;
 
-    // 2. RUN THE CONCURRENT ASYNCHRONOUS PIPELINE BENCHMARK
-    {
-        int loops_per_thread = 100;
-        struct timeval start_time, stop_time;
-        std::vector<std::thread> workers;
+    printf("--- Starting Real-Time ALPR Inference Loop ---\n");
 
-        gettimeofday(&start_time, NULL);
+    while (cap.read(bgr_frame)) {
+        // [TIMING STAGE 0] Pipeline Start
+        double t0_start = get_current_time_ms();
 
-        // Spawn 3 concurrent hardware execution loops matching the 3 cores
-        for (int core_id = 0; core_id < 3; ++core_id)
-        {
-            workers.push_back(std::thread([&rknn_ctx_pool, core_id, loops_per_thread]() {
-                for (int i = 0; i < loops_per_thread; ++i) {
-                    // Triggers the low-level runtime hardware driver with zero user-space memory overhead
-                    rknn_run(rknn_ctx_pool[core_id].rknn_ctx, NULL);
-                }
-            }));
+        // -----------------------------------------
+        // STAGE 1: Pre-processing (Video Frame Prep)
+        // -----------------------------------------
+        cv::cvtColor(bgr_frame, rgb_frame, cv::COLOR_BGR2RGB);
+
+        image_buffer_t src_image;
+        memset(&src_image, 0, sizeof(image_buffer_t));
+        src_image.width = rgb_frame.cols;
+        src_image.height = rgb_frame.rows;
+        src_image.width_stride = rgb_frame.cols;
+        src_image.height_stride = rgb_frame.rows;
+        src_image.format = IMAGE_FORMAT_RGB888; 
+        src_image.virt_addr = rgb_frame.data; 
+        src_image.size = rgb_frame.total() * rgb_frame.channels();
+        
+        // [TIMING STAGE 1] Pre-processing complete
+        double t1_prep = get_current_time_ms();
+
+        // -----------------------------------------
+        // STAGE 2: AI Detection (YOLO Vehicle/Plate)
+        // -----------------------------------------
+        ret = inference_yolo11_model(&rknn_app_ctx, &src_image, &od_results);
+        if (ret != 0) break;
+        
+        // [TIMING STAGE 2] YOLO Detection complete
+        double t2_detect = get_current_time_ms();
+
+        // -----------------------------------------
+        // STAGE 3: AI OCR (FUTURE ALPR INTEGRATION)
+        // -----------------------------------------
+        // TODO: Loop through od_results. If class == "license_plate", 
+        // crop the bounding box from bgr_frame and pass to the OCR model.
+        
+        // [TIMING STAGE 3] OCR complete
+        double t3_ocr = get_current_time_ms(); 
+
+        // -----------------------------------------
+        // STAGE 4: Post-processing (Draw & Encode)
+        // -----------------------------------------
+        for (int i = 0; i < od_results.count; i++) {
+            object_detect_result *det_result = &(od_results.results[i]);
+            cv::rectangle(bgr_frame, cv::Point(det_result->box.left, det_result->box.top), 
+                          cv::Point(det_result->box.right, det_result->box.bottom), cv::Scalar(0, 255, 0), 2);
+            char text[256];
+            // TODO: Append OCR text results to this string in the future
+            sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
+            cv::putText(bgr_frame, text, cv::Point(det_result->box.left, det_result->box.top - 10), 
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
         }
 
-        // Wait for all three threads to finish their 100-frame workloads
-        for (auto &t : workers) {
-            if (t.joinable()) t.join();
+        writer.write(bgr_frame);
+        
+        // [TIMING STAGE 4] Post-processing & File I/O complete
+        double t4_end = get_current_time_ms();
+
+        // -----------------------------------------
+        // PIPELINE METRICS REPORTING
+        // -----------------------------------------
+        if (frame_count % 30 == 0) {
+            double prep_time = t1_prep - t0_start;
+            double detect_time = t2_detect - t1_prep;
+            double ocr_time = t3_ocr - t2_detect;
+            double post_time = t4_end - t3_ocr;
+            double total_time = t4_end - t0_start;
+            
+            printf("Frame %4d | Total: %5.1fms | FPS: %4.1f | Profiling -> Prep: %4.1fms | Det: %4.1fms | OCR: %4.1fms | Post: %4.1fms\n", 
+                   frame_count, total_time, 1000.0 / total_time, prep_time, detect_time, ocr_time, post_time);
         }
-
-        gettimeofday(&stop_time, NULL);
-        double total_time_ms = (stop_time.tv_sec - start_time.tv_sec) * 1000.0 + 
-                               (stop_time.tv_usec - start_time.tv_usec) / 1000.0;
-
-        // Math breakdown: 3 hardware threads running 100 frames each = 300 total frames computed
-        int total_frames_processed = 3 * loops_per_thread;
-        double parallel_batch_latency = total_time_ms / loops_per_thread;
-
-        printf("\n=======================================\n");
-        printf("Asynchronous 3-Core NPU Pipeline Benchmark:\n");
-        printf("Model Target Variant      : YOLOv11s (Small)\n");
-        printf("Total Time for 300 Frames : %.2f ms\n", total_time_ms);
-        printf("Parallel Batch Latency    : %.2f ms/batch\n", parallel_batch_latency);
-        printf("Combined System Throughput : %.2f FPS 🔥\n", (total_frames_processed / total_time_ms) * 1000.0);
-        printf("=======================================\n\n");
+        frame_count++;
     }
 
-    // Use the results from context 0 to draw our bounding box visualizations
-    char text[256];
-    for (int i = 0; i < od_results_pool[0].count; i++)
-    {
-        object_detect_result *det_result = &(od_results_pool[0].results[i]);
-        int x1 = det_result->box.left;
-        int y1 = det_result->box.top;
-        int x2 = det_result->box.right;
-        int y2 = det_result->box.bottom;
-
-        draw_rectangle(&src_image, x1, y1, x2 - x1, y2 - y1, COLOR_BLUE, 3);
-        sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
-        draw_text(&src_image, text, x1, y1 - 20, COLOR_RED, 10);
-    }
-    write_image("out.png", &src_image);
-
-    // Clean up all persistent memory pools across context allocations
+    // Clean up
+    cap.release();
+    writer.release();
     deinit_post_process();
-    for (int i = 0; i < 3; ++i) {
-        release_yolo11_model(&rknn_ctx_pool[i]);
-    }
-    free(src_image.virt_addr);
-
+    release_yolo11_model(&rknn_app_ctx);
+    
+    printf("\nFinished! Processed %d frames. Saved to 'output_hardware.mp4'\n", frame_count);
     return 0;
 }

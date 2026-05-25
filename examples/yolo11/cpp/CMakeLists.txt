@@ -2,6 +2,13 @@ cmake_minimum_required(VERSION 3.10)
 
 project(rknn_yolo11_demo)
 
+# === NEW: FIND OPENCV IN THE SYSTEM ===
+find_package(OpenCV REQUIRED)
+message(STATUS "OpenCV library status:")
+message(STATUS "    version: ${OpenCV_VERSION}")
+message(STATUS "    libraries: ${OpenCV_LIBS}")
+message(STATUS "    include path: ${OpenCV_INCLUDE_DIRS}")
+
 if (ENABLE_ASAN)
 	message(STATUS "BUILD WITH ADDRESS SANITIZER")
 	set (CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -fno-omit-frame-pointer -fsanitize=address")
@@ -41,6 +48,7 @@ target_link_libraries(${PROJECT_NAME}
     fileutils
     imagedrawing    
     ${LIBRKNNRT}
+    ${OpenCV_LIBS} # <-- LINK OPENCV
     dl
 )
 
@@ -60,6 +68,7 @@ endif()
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${LIBRKNNRT_INCLUDES}
+    ${OpenCV_INCLUDE_DIRS} # <-- INCLUDE OPENCV HEADERS
 )
 
 
@@ -79,6 +88,7 @@ if (NOT (TARGET_SOC STREQUAL "rv1106" OR TARGET_SOC STREQUAL "rv1103" OR TARGET_
         fileutils
         imagedrawing    
         ${LIBRKNNRT}
+        ${OpenCV_LIBS} # <-- LINK OPENCV
         dl
     )
 
@@ -97,6 +107,7 @@ if (NOT (TARGET_SOC STREQUAL "rv1106" OR TARGET_SOC STREQUAL "rv1103" OR TARGET_
     target_include_directories(${PROJECT_NAME}_zero_copy PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${LIBRKNNRT_INCLUDES}
+        ${OpenCV_INCLUDE_DIRS} # <-- INCLUDE OPENCV HEADERS
     )
     install(TARGETS ${PROJECT_NAME}_zero_copy DESTINATION .)
 endif()
@@ -104,5 +115,6 @@ endif()
 install(TARGETS ${PROJECT_NAME} DESTINATION .)
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../model/bus.jpg DESTINATION model)
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../model/coco_80_labels_list.txt DESTINATION model)
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../model/test_video.mp4 DESTINATION model)
 file(GLOB RKNN_FILES "${CMAKE_CURRENT_SOURCE_DIR}/../model/*.rknn")
 install(FILES ${RKNN_FILES} DESTINATION model)
