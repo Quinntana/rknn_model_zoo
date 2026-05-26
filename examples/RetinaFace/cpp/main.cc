@@ -19,11 +19,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h> // <-- ADDED: For timing
 
 #include "retinaface.h"
 #include "image_utils.h"
 #include "image_drawing.h"
 #include "file_utils.h"
+
+// <-- ADDED: Timing Helper Function
+double get_current_time_ms() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
 
 /*-------------------------------------------
                   Main Function
@@ -46,6 +54,9 @@ int main(int argc, char **argv) {
         return -1;
     }
 
+    // Pin to Core 1 (Optional, but good practice for benchmarks)
+    rknn_set_core_mask(rknn_app_ctx.rknn_ctx, RKNN_NPU_CORE_1);
+
     image_buffer_t src_image;
     memset(&src_image, 0, sizeof(image_buffer_t));
     ret = read_image(image_path, &src_image);
@@ -55,12 +66,43 @@ int main(int argc, char **argv) {
     }
 
     retinaface_result result;
-    ret = inference_retinaface_model(&rknn_app_ctx, &src_image, &result);
-    if (ret != 0) {
-        printf("init_retinaface_model fail! ret=%d\n", ret);
-        goto out;
+
+    // <-- ADDED: Warm-up Run (Locks NPU memory into active state)
+    printf("--> Running NPU Warm-up...\n");
+    inference_retinaface_model(&rknn_app_ctx, &src_image, &result);
+
+    // <-- ADDED: 50-Iteration Benchmark Loop
+    int loop_count = 50;
+    double total_pipeline_time = 0.0;
+    
+    printf("--> Starting Benchmark (%d iterations)...\n", loop_count);
+    
+    for (int i = 0; i < loop_count; ++i) {
+        double start_time = get_current_time_ms();
+        
+        ret = inference_retinaface_model(&rknn_app_ctx, &src_image, &result);
+        if (ret != 0) {
+            printf("inference_retinaface_model fail on loop %d! ret=%d\n", i, ret);
+            goto out;
+        }
+        
+        double end_time = get_current_time_ms();
+        total_pipeline_time += (end_time - start_time);
     }
 
+    // Print Metrics
+    {
+        double avg_time = total_pipeline_time / loop_count;
+        printf("\n==========================================\n");
+        printf("   RETINAFACE NPU BENCHMARK RESULTS\n");
+        printf("==========================================\n");
+        printf("Total Iterations  : %d\n", loop_count);
+        printf("Avg Total Latency : %.2f ms / frame\n", avg_time);
+        printf("Est. Throughput   : %.2f FPS\n", 1000.0 / avg_time);
+        printf("==========================================\n\n");
+    }
+
+    // Draw results using only the final output to save I/O time
     for (int i = 0; i < result.count; ++i) {
         int rx = result.object[i].box.left;
         int ry = result.object[i].box.top;
