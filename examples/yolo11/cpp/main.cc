@@ -37,31 +37,37 @@ int main(int argc, char **argv)
     const char *video_path = argv[3];
     int ret;
 
-    // 1. INITIALIZE DUAL CONTEXTS (Notice the strictly separated struct types!)
-    rknn_app_context_t yolo_ctx;
-    retina_app_context_t retina_ctx; 
+    // 1. Declare 3 independent contexts for each model type
+    rknn_app_context_t yolo_ctxs[3];
+    retina_app_context_t retina_ctxs[3]; 
     
-    memset(&yolo_ctx, 0, sizeof(rknn_app_context_t));
-    memset(&retina_ctx, 0, sizeof(retina_app_context_t));
+    memset(yolo_ctxs, 0, sizeof(yolo_ctxs));
+    memset(retina_ctxs, 0, sizeof(retina_ctxs));
     init_post_process();
 
-    // Init YOLO and allow RK3588 multi-core execution instead of single-core pinning
-    ret = init_yolo11_model(yolo_path, &yolo_ctx);
-    if (ret != 0) return -1;
-    rknn_set_core_mask(yolo_ctx.rknn_ctx, RKNN_NPU_CORE_0_1_2);
-    ret = rknn_set_batch_core_num(yolo_ctx.rknn_ctx, 3);
-    if (ret != RKNN_SUCC) {
-        printf("rknn_set_batch_core_num(yolo) fail! ret=%d\n", ret);
+    // 2. Initialize the 3 YOLO Contexts with Core Auto-Scheduling
+    for (int i = 0; i < 3; i++) {
+        ret = init_yolo11_model(yolo_path, &yolo_ctxs[i]);
+        if (ret != 0) {
+            printf("Failed to init YOLO context %d\n", i);
+            return -1;
+        }
+        // Tell the driver to dynamically route each context to any free core
+        rknn_set_core_mask(yolo_ctxs[i].rknn_ctx, RKNN_NPU_CORE_AUTO);
     }
+    printf("Successfully initialized 3 isolated YOLO contexts on AUTO core mode.\n");
 
-    // Put RetinaFace on the same RK3588 multi-core mode so it can use all NPU cores
-    ret = init_retinaface_model(retina_path, &retina_ctx);
-    if (ret != 0) return -1;
-    rknn_set_core_mask(retina_ctx.rknn_ctx, RKNN_NPU_CORE_0_1_2);
-    ret = rknn_set_batch_core_num(retina_ctx.rknn_ctx, 3);
-    if (ret != RKNN_SUCC) {
-        printf("rknn_set_batch_core_num(retina) fail! ret=%d\n", ret);
+    // 3. Initialize the 3 RetinaFace Contexts with Core Auto-Scheduling
+    for (int i = 0; i < 3; i++) {
+        ret = init_retinaface_model(retina_path, &retina_ctxs[i]);
+        if (ret != 0) {
+            printf("Failed to init RetinaFace context %d\n", i);
+            return -1;
+        }
+        // Tell the driver to dynamically route each context to any free core
+        rknn_set_core_mask(retina_ctxs[i].rknn_ctx, RKNN_NPU_CORE_AUTO);
     }
+    printf("Successfully initialized 3 isolated RetinaFace contexts on AUTO core mode.\n");
 
     std::string pipeline = "filesrc location=" + std::string(video_path) + 
                            " ! qtdemux ! h264parse ! mppvideodec ! videoconvert ! video/x-raw,format=BGR ! appsink drop=true max-buffers=1";
@@ -104,7 +110,7 @@ int main(int argc, char **argv)
         
         double t1_prep = get_current_time_ms();
 
-        ret = inference_yolo11_model(&yolo_ctx, &src_image, &od_results);
+        ret = inference_yolo11_model(&yolo_ctxs[0], &src_image, &od_results);
         if (ret != 0) break;
         
         double t2_detect = get_current_time_ms();
@@ -141,7 +147,7 @@ int main(int argc, char **argv)
                 crop_img.size = person_crop.total() * person_crop.channels();
 
                 retinaface_result retina_res;
-                inference_retinaface_model(&retina_ctx, &crop_img, &retina_res);
+                inference_retinaface_model(&retina_ctxs[0], &crop_img, &retina_res);
 
                 for (int f = 0; f < retina_res.count; f++) {
                     if (retina_res.object[f].score > 0.5) { 
@@ -188,9 +194,10 @@ int main(int argc, char **argv)
     cap.release();
     writer.release();
     deinit_post_process();
-    release_yolo11_model(&yolo_ctx);
-    release_retinaface_model(&retina_ctx);
-    
+    for (int i = 0; i < 3; i++) {
+        release_yolo11_model(&yolo_ctxs[i]);
+        release_retinaface_model(&retina_ctxs[i]);
+    }
     printf("\nFinished! Processed %d frames. Saved to 'output_cascaded.mp4'\n", frame_count);
     return 0;
 }

@@ -47,6 +47,8 @@ typedef struct {
     int model_width;
     int model_height;
     bool is_quant;
+
+    unsigned char* preprocess_buf;
 } rknn_app_context_t;
 
 #include "postprocess.h"

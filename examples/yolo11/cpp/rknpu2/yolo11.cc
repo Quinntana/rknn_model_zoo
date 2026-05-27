@@ -22,11 +22,6 @@
 #include "file_utils.h"
 #include "image_utils.h"
 
-// =========================================================================
-// !!! OPTIMIZATION CHANGE: Persistent Preprocessing Memory Pool !!!
-// =========================================================================
-static unsigned char* g_preprocess_buf = NULL;
-
 static void dump_tensor_attr(rknn_tensor_attr *attr)
 {
     printf("  index=%d, name=%s, n_dims=%d, dims=[%d, %d, %d, %d], n_elems=%d, size=%d, fmt=%s, type=%s, qnt_type=%s, "
@@ -138,14 +133,11 @@ int init_yolo11_model(const char *model_path, rknn_app_context_t *app_ctx)
     printf("model input height=%d, width=%d, channel=%d\n",
            app_ctx->model_height, app_ctx->model_width, app_ctx->model_channel);
 
-    // =========================================================================
-    // !!! OPTIMIZATION CHANGE: Allocate the Persistent Buffer ONCE here !!!
-    // =========================================================================
     int buffer_size = app_ctx->model_width * app_ctx->model_height * app_ctx->model_channel;
-    g_preprocess_buf = (unsigned char *)malloc(buffer_size);
-    if (g_preprocess_buf == NULL)
+    app_ctx->preprocess_buf = (unsigned char *)malloc(buffer_size);
+    if (app_ctx->preprocess_buf == NULL)
     {
-        printf("Global preprocess buffer allocation fail!\n");
+        printf("Context preprocess buffer allocation fail!\n");
         return -1;
     }
 
@@ -173,10 +165,10 @@ int release_yolo11_model(rknn_app_context_t *app_ctx)
     // =========================================================================
     // !!! OPTIMIZATION CHANGE: Free the Persistent Buffer ONCE on Shutdown !!!
     // =========================================================================
-    if (g_preprocess_buf != NULL)
+    if (app_ctx->preprocess_buf != NULL)
     {
-        free(g_preprocess_buf);
-        g_preprocess_buf = NULL;
+        free(app_ctx->preprocess_buf);
+        app_ctx->preprocess_buf = NULL;
     }
 
     return 0;
@@ -213,7 +205,7 @@ int inference_yolo11_model(rknn_app_context_t *app_ctx, image_buffer_t *img, obj
     // =========================================================================
     // !!! OPTIMIZATION CHANGE: Swapped dynamic malloc for persistent pointer !!!
     // =========================================================================
-    dst_img.virt_addr = g_preprocess_buf; 
+    dst_img.virt_addr = app_ctx->preprocess_buf;
 
     // letterbox
     ret = convert_image_with_letterbox(img, &dst_img, &letter_box, bg_color);
