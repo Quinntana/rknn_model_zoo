@@ -45,15 +45,23 @@ int main(int argc, char **argv)
     memset(&retina_ctx, 0, sizeof(retina_app_context_t));
     init_post_process();
 
-    // Init YOLO (let RKNN choose the best RK3588 NPU cores)
+    // Init YOLO and allow RK3588 multi-core execution instead of single-core pinning
     ret = init_yolo11_model(yolo_path, &yolo_ctx);
     if (ret != 0) return -1;
-    rknn_set_core_mask(yolo_ctx.rknn_ctx, RKNN_NPU_CORE_ALL);
+    rknn_set_core_mask(yolo_ctx.rknn_ctx, RKNN_NPU_CORE_0_1_2);
+    ret = rknn_set_batch_core_num(yolo_ctx.rknn_ctx, 3);
+    if (ret != RKNN_SUCC) {
+        printf("rknn_set_batch_core_num(yolo) fail! ret=%d\n", ret);
+    }
 
-    // Init RetinaFace on a different core from the default YOLO path
+    // Put RetinaFace on the same RK3588 multi-core mode so it can use all NPU cores
     ret = init_retinaface_model(retina_path, &retina_ctx);
     if (ret != 0) return -1;
-    rknn_set_core_mask(retina_ctx.rknn_ctx, RKNN_NPU_CORE_1);
+    rknn_set_core_mask(retina_ctx.rknn_ctx, RKNN_NPU_CORE_0_1_2);
+    ret = rknn_set_batch_core_num(retina_ctx.rknn_ctx, 3);
+    if (ret != RKNN_SUCC) {
+        printf("rknn_set_batch_core_num(retina) fail! ret=%d\n", ret);
+    }
 
     std::string pipeline = "filesrc location=" + std::string(video_path) + 
                            " ! qtdemux ! h264parse ! mppvideodec ! videoconvert ! video/x-raw,format=BGR ! appsink drop=true max-buffers=1";
@@ -73,7 +81,7 @@ int main(int argc, char **argv)
     cv::Mat bgr_frame, rgb_frame;
     object_detect_result_list od_results;
     int frame_count = 0;
-    int MAX_FRAMES = 100; // 5 seconds of video for testing
+    int MAX_FRAMES = 300; // 5 seconds of video for testing
 
     printf("--- Starting Real-Time Cascaded Inference Loop ---\n");
 
