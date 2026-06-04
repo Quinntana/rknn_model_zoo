@@ -7,6 +7,13 @@
 #include <sys/time.h>
 #include <string>
 #include <algorithm> // Needed for std::max / std::min
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <vector>
+#include <thread>
 
 // Include OpenCV
 #include <opencv2/opencv.hpp>
@@ -25,6 +32,267 @@ double get_current_time_ms() {
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
+static const char *LOG_RESET = "\033[0m";
+static const char *LOG_RED = "\033[31m";
+static const char *LOG_GREEN = "\033[32m";
+static const char *LOG_YELLOW = "\033[33m";
+static const char *LOG_BLUE = "\033[34m";
+static const char *LOG_CYAN = "\033[36m";
+
+struct StageBatchStats {
+    const char *color = LOG_RESET;
+    double sum_ms = 0.0;
+    size_t count = 0;
+    size_t first_seq = 0;
+    size_t last_seq = 0;
+};
+
+static std::mutex g_stage_log_mutex;
+static std::map<std::string, StageBatchStats> g_stage_log_stats;
+
+static image_buffer_t make_rgb_image_buffer(cv::Mat &frame)
+{
+    image_buffer_t img;
+    memset(&img, 0, sizeof(image_buffer_t));
+    img.width = frame.cols;
+    img.height = frame.rows;
+    img.width_stride = frame.cols;
+    img.height_stride = frame.rows;
+    img.format = IMAGE_FORMAT_RGB888;
+    img.virt_addr = frame.data;
+    img.size = frame.total() * frame.channels();
+    return img;
+}
+
+static void log_stage_time(const char *color, const char *stage, size_t seq, double ms)
+{
+    const size_t batch_id = seq / 30;
+    const std::string key = std::string(stage) + "#" + std::to_string(batch_id);
+
+    std::lock_guard<std::mutex> lock(g_stage_log_mutex);
+    auto &stats = g_stage_log_stats[key];
+    if (stats.count == 0) {
+        stats.color = color;
+        stats.first_seq = seq;
+    }
+    stats.last_seq = seq;
+    stats.sum_ms += ms;
+    stats.count++;
+
+    if (stats.count == 30) {
+        printf("%s[%s][batch-%zu][frames-%zu-%zu] avg %.2f ms%s\n",
+               stats.color, stage, batch_id, stats.first_seq, stats.last_seq, stats.sum_ms / 30.0, LOG_RESET);
+        g_stage_log_stats.erase(key);
+    }
+}
+
+static void flush_stage_time_logs()
+{
+    std::lock_guard<std::mutex> lock(g_stage_log_mutex);
+    for (const auto &entry : g_stage_log_stats) {
+        const std::string &key = entry.first;
+        const StageBatchStats &stats = entry.second;
+        const size_t pos = key.find('#');
+        const std::string stage = key.substr(0, pos);
+        const std::string batch = key.substr(pos + 1);
+        printf("%s[%s][batch-%s][frames-%zu-%zu] avg %.2f ms%s\n",
+               stats.color, stage.c_str(), batch.c_str(), stats.first_seq, stats.last_seq, stats.sum_ms / stats.count, LOG_RESET);
+    }
+    g_stage_log_stats.clear();
+}
+
+struct FramePacket {
+    size_t seq = 0;
+    cv::Mat bgr_frame;
+    cv::Mat rgb_frame;
+    object_detect_result_list od_results;
+    double source_read_start_ms = 0.0;
+    bool has_yolo = false;
+};
+
+static void yolo_worker(rknn_app_context_t *yolo_ctx,
+                        std::deque<FramePacket> *input_queue,
+                        std::deque<FramePacket> *retina_queue,
+                        std::mutex *queue_mutex,
+                        std::condition_variable *queue_cv,
+                        std::atomic<bool> *capture_done,
+                        std::atomic<bool> *stop_requested,
+                        size_t max_retina_queue_size,
+                        int worker_id)
+{
+    while (true) {
+        FramePacket packet;
+
+        {
+            std::unique_lock<std::mutex> lock(*queue_mutex);
+            queue_cv->wait(lock, [&]() {
+                return !input_queue->empty() || capture_done->load() || stop_requested->load();
+            });
+
+            if (stop_requested->load()) {
+                return;
+            }
+
+            if (input_queue->empty()) {
+                if (capture_done->load()) {
+                    break;
+                }
+                continue;
+            }
+
+            packet = std::move(input_queue->front());
+            input_queue->pop_front();
+            queue_cv->notify_all();
+        }
+
+        double yolo_prep_start_ms = get_current_time_ms();
+        cv::cvtColor(packet.bgr_frame, packet.rgb_frame, cv::COLOR_BGR2RGB);
+
+        image_buffer_t src_image = make_rgb_image_buffer(packet.rgb_frame);
+        double yolo_prep_ms = get_current_time_ms() - yolo_prep_start_ms;
+
+        double yolo_npu_start_ms = get_current_time_ms();
+        int ret = inference_yolo11_model(yolo_ctx, &src_image, &packet.od_results);
+        double yolo_npu_ms = get_current_time_ms() - yolo_npu_start_ms;
+        if (ret != 0) {
+            printf("YOLO worker fail! ret=%d\n", ret);
+            stop_requested->store(true);
+            return;
+        }
+
+        packet.has_yolo = true;
+        log_stage_time(LOG_BLUE, "yolo-prep", packet.seq, yolo_prep_ms);
+        log_stage_time(LOG_GREEN, "yolo-npu", packet.seq, yolo_npu_ms);
+
+        {
+            std::unique_lock<std::mutex> lock(*queue_mutex);
+            if (retina_queue->size() >= max_retina_queue_size) {
+                FramePacket dropped = std::move(retina_queue->front());
+                retina_queue->pop_front();
+                printf("%s[drop][worker-%d][frame-%zu] retina backlog full, dropping oldest frame%s\n",
+                       LOG_YELLOW, worker_id, dropped.seq, LOG_RESET);
+            }
+            retina_queue->push_back(std::move(packet));
+        }
+        queue_cv->notify_all();
+    }
+}
+
+static void retina_worker(retina_app_context_t *retina_ctx,
+                          std::deque<FramePacket> *retina_queue,
+                          std::mutex *queue_mutex,
+                          std::condition_variable *queue_cv,
+                          std::atomic<bool> *capture_done,
+                          std::atomic<bool> *stop_requested,
+                          std::map<size_t, FramePacket> *finished_frames,
+                          int worker_id)
+{
+    while (true) {
+        FramePacket packet;
+
+        {
+            std::unique_lock<std::mutex> lock(*queue_mutex);
+            queue_cv->wait(lock, [&]() {
+                return !retina_queue->empty() || capture_done->load() || stop_requested->load();
+            });
+
+            if (stop_requested->load()) {
+                return;
+            }
+
+            if (retina_queue->empty()) {
+                if (capture_done->load()) {
+                    break;
+                }
+                continue;
+            }
+
+            packet = std::move(retina_queue->front());
+            retina_queue->pop_front();
+            queue_cv->notify_all();
+        }
+
+        double retina_npu_start_ms = 0.0;
+        double retina_draw_start_ms = 0.0;
+        if (packet.has_yolo) {
+            retina_npu_start_ms = get_current_time_ms();
+            retina_draw_start_ms = 0.0;
+            for (int i = 0; i < packet.od_results.count; i++) {
+                object_detect_result *det_result = &(packet.od_results.results[i]);
+
+                if (det_result->cls_id == 0) {
+                    int x1 = std::max(0, det_result->box.left) & (~15);
+                    int y1 = std::max(0, det_result->box.top) & (~15);
+                    int x2 = std::min(packet.rgb_frame.cols - 1, det_result->box.right);
+                    int y2 = std::min(packet.rgb_frame.rows - 1, det_result->box.bottom);
+
+                    int crop_w = (x2 - x1) & (~15);
+                    int crop_h = (y2 - y1) & (~15);
+
+                    if (crop_w > 0 && crop_h > 0) {
+                        cv::Mat person_crop = packet.rgb_frame(cv::Rect(x1, y1, crop_w, crop_h)).clone();
+
+                        image_buffer_t crop_img = make_rgb_image_buffer(person_crop);
+
+                        retinaface_result retina_res;
+                        int ret = inference_retinaface_model(retina_ctx, &crop_img, &retina_res);
+                        if (ret != 0) {
+                            printf("Retina worker fail! ret=%d\n", ret);
+                            stop_requested->store(true);
+                            return;
+                        }
+
+                        for (int f = 0; f < retina_res.count; f++) {
+                            if (retina_res.object[f].score > 0.5) {
+                                for (int p = 0; p < 5; p++) {
+                                    int global_x = x1 + retina_res.object[f].ponit[p].x;
+                                    int global_y = y1 + retina_res.object[f].ponit[p].y;
+                                    cv::circle(packet.bgr_frame, cv::Point(global_x, global_y), 4, cv::Scalar(0, 165, 255), -1);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            double retina_npu_ms = get_current_time_ms() - retina_npu_start_ms;
+            log_stage_time(LOG_CYAN, "retina-npu", packet.seq, retina_npu_ms);
+
+            retina_draw_start_ms = get_current_time_ms();
+            for (int i = 0; i < packet.od_results.count; i++) {
+                object_detect_result *det_result = &(packet.od_results.results[i]);
+
+                cv::rectangle(packet.bgr_frame,
+                              cv::Point(det_result->box.left, det_result->box.top),
+                              cv::Point(det_result->box.right, det_result->box.bottom),
+                              cv::Scalar(0, 255, 0), 2);
+                char text[256];
+                sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
+                cv::putText(packet.bgr_frame, text,
+                            cv::Point(det_result->box.left, det_result->box.top - 10),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
+            }
+        }
+
+        double retina_draw_ms = 0.0;
+        if (retina_draw_start_ms > 0.0) {
+            retina_draw_ms = get_current_time_ms() - retina_draw_start_ms;
+            log_stage_time(LOG_BLUE, "retina-draw", packet.seq, retina_draw_ms);
+        }
+
+        double end_to_end_ms = 0.0;
+        if (packet.source_read_start_ms > 0.0) {
+            end_to_end_ms = get_current_time_ms() - packet.source_read_start_ms;
+            log_stage_time(LOG_YELLOW, "e2e", packet.seq, end_to_end_ms);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(*queue_mutex);
+            (*finished_frames)[packet.seq] = std::move(packet);
+        }
+        queue_cv->notify_all();
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 4) {
@@ -37,37 +305,7 @@ int main(int argc, char **argv)
     const char *video_path = argv[3];
     int ret;
 
-    // 1. Declare 3 independent contexts for each model type
-    rknn_app_context_t yolo_ctxs[3];
-    retina_app_context_t retina_ctxs[3]; 
-    
-    memset(yolo_ctxs, 0, sizeof(yolo_ctxs));
-    memset(retina_ctxs, 0, sizeof(retina_ctxs));
     init_post_process();
-
-    // 2. Initialize the 3 YOLO Contexts with Core Auto-Scheduling
-    for (int i = 0; i < 3; i++) {
-        ret = init_yolo11_model(yolo_path, &yolo_ctxs[i]);
-        if (ret != 0) {
-            printf("Failed to init YOLO context %d\n", i);
-            return -1;
-        }
-        // Tell the driver to dynamically route each context to any free core
-        rknn_set_core_mask(yolo_ctxs[i].rknn_ctx, RKNN_NPU_CORE_AUTO);
-    }
-    printf("Successfully initialized 3 isolated YOLO contexts on AUTO core mode.\n");
-
-    // 3. Initialize the 3 RetinaFace Contexts with Core Auto-Scheduling
-    for (int i = 0; i < 3; i++) {
-        ret = init_retinaface_model(retina_path, &retina_ctxs[i]);
-        if (ret != 0) {
-            printf("Failed to init RetinaFace context %d\n", i);
-            return -1;
-        }
-        // Tell the driver to dynamically route each context to any free core
-        rknn_set_core_mask(retina_ctxs[i].rknn_ctx, RKNN_NPU_CORE_AUTO);
-    }
-    printf("Successfully initialized 3 isolated RetinaFace contexts on AUTO core mode.\n");
 
     std::string pipeline = "filesrc location=" + std::string(video_path) + 
                            " ! qtdemux ! h264parse ! mppvideodec ! videoconvert ! video/x-raw,format=BGR ! appsink drop=true max-buffers=1";
@@ -81,123 +319,169 @@ int main(int argc, char **argv)
     int w = cap.get(cv::CAP_PROP_FRAME_WIDTH);
     int h = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
 
-    std::string out_pipeline = "appsrc ! videoconvert ! video/x-raw,format=NV12 ! mpph264enc ! h264parse ! mp4mux ! filesink location=output_cascaded.mp4";
-    cv::VideoWriter writer(out_pipeline, cv::CAP_GSTREAMER, 0, 30, cv::Size(w, h));
+    std::deque<FramePacket> yolo_queue;
+    std::deque<FramePacket> retina_queue;
+    std::mutex queue_mutex;
+    std::condition_variable queue_cv;
+    std::atomic<bool> capture_done(false);
+    std::atomic<bool> stop_requested(false);
+    std::map<size_t, FramePacket> finished_frames;
+    const size_t max_yolo_queue_size = 4;
+    const size_t max_retina_queue_size = 8;
+    const int yolo_worker_count = 3;
+    const int retina_worker_count = 3;
+    const int max_frames = 100;
 
-    cv::Mat bgr_frame, rgb_frame;
-    object_detect_result_list od_results;
+    std::vector<rknn_app_context_t> yolo_contexts(yolo_worker_count);
+    std::vector<retina_app_context_t> retina_contexts(retina_worker_count);
+    for (int i = 0; i < yolo_worker_count; ++i) {
+        memset(&yolo_contexts[i], 0, sizeof(rknn_app_context_t));
+        ret = init_yolo11_model(yolo_path, &yolo_contexts[i]);
+        if (ret != 0) {
+            for (int j = 0; j < i; ++j) {
+                release_yolo11_model(&yolo_contexts[j]);
+            }
+            return -1;
+        }
+        rknn_set_core_mask(yolo_contexts[i].rknn_ctx, RKNN_NPU_CORE_AUTO);
+        ret = rknn_set_batch_core_num(yolo_contexts[i].rknn_ctx, 3);
+        if (ret != RKNN_SUCC) {
+            printf("rknn_set_batch_core_num(yolo-%d) fail! ret=%d\n", i, ret);
+        }
+    }
+    for (int i = 0; i < retina_worker_count; ++i) {
+        memset(&retina_contexts[i], 0, sizeof(retina_app_context_t));
+        ret = init_retinaface_model(retina_path, &retina_contexts[i]);
+        if (ret != 0) {
+            for (int j = 0; j < yolo_worker_count; ++j) {
+                release_yolo11_model(&yolo_contexts[j]);
+            }
+            for (int j = 0; j < i; ++j) {
+                release_retinaface_model(&retina_contexts[j]);
+            }
+            return -1;
+        }
+        rknn_set_core_mask(retina_contexts[i].rknn_ctx, RKNN_NPU_CORE_AUTO);
+        ret = rknn_set_batch_core_num(retina_contexts[i].rknn_ctx, 3);
+        if (ret != RKNN_SUCC) {
+            printf("rknn_set_batch_core_num(retina-%d) fail! ret=%d\n", i, ret);
+        }
+    }
+
+    std::vector<std::thread> yolo_threads;
+    std::vector<std::thread> retina_threads;
+    yolo_threads.reserve(yolo_worker_count);
+    retina_threads.reserve(retina_worker_count);
+    for (int i = 0; i < yolo_worker_count; ++i) {
+        yolo_threads.emplace_back(yolo_worker,
+                                  &yolo_contexts[i],
+                                  &yolo_queue,
+                                  &retina_queue,
+                                  &queue_mutex,
+                                  &queue_cv,
+                                  &capture_done,
+                                  &stop_requested,
+                                  max_retina_queue_size,
+                                  i);
+    }
+    for (int i = 0; i < retina_worker_count; ++i) {
+        retina_threads.emplace_back(retina_worker,
+                                    &retina_contexts[i],
+                                    &retina_queue,
+                                    &queue_mutex,
+                                    &queue_cv,
+                                    &capture_done,
+                                    &stop_requested,
+                                    &finished_frames,
+                                    i);
+    }
+
+    cv::Mat bgr_frame;
     int frame_count = 0;
-    int MAX_FRAMES = 300; // 5 seconds of video for testing
 
     printf("--- Starting Real-Time Cascaded Inference Loop ---\n");
 
-    while (cap.read(bgr_frame)) {
-        if (frame_count >= MAX_FRAMES) break;
+    double source_read_total_ms = 0.0;
+    double clone_total_ms = 0.0;
+    while (true) {
+        if (stop_requested.load() || frame_count >= max_frames) {
+            break;
+        }
 
-        double t0_start = get_current_time_ms();
+        double source_read_start_ms = get_current_time_ms();
+        if (!cap.read(bgr_frame)) {
+            break;
+        }
+        double source_read_ms = get_current_time_ms() - source_read_start_ms;
+        source_read_total_ms += source_read_ms;
+        log_stage_time(LOG_RED, "source-read", frame_count, source_read_ms);
 
-        cv::cvtColor(bgr_frame, rgb_frame, cv::COLOR_BGR2RGB);
+        double clone_start_ms = get_current_time_ms();
+        FramePacket packet;
+        packet.seq = frame_count;
+        packet.source_read_start_ms = source_read_start_ms;
+        packet.bgr_frame = bgr_frame.clone();
+        double clone_ms = get_current_time_ms() - clone_start_ms;
+        clone_total_ms += clone_ms;
+        log_stage_time(LOG_BLUE, "capture-clone", packet.seq, clone_ms);
 
-        image_buffer_t src_image;
-        memset(&src_image, 0, sizeof(image_buffer_t));
-        src_image.width = rgb_frame.cols;
-        src_image.height = rgb_frame.rows;
-        src_image.width_stride = rgb_frame.cols;
-        src_image.height_stride = rgb_frame.rows;
-        src_image.format = IMAGE_FORMAT_RGB888; 
-        src_image.virt_addr = rgb_frame.data; 
-        src_image.size = rgb_frame.total() * rgb_frame.channels();
-        
-        double t1_prep = get_current_time_ms();
-
-        ret = inference_yolo11_model(&yolo_ctxs[0], &src_image, &od_results);
-        if (ret != 0) break;
-        
-        double t2_detect = get_current_time_ms();
-
-        for (int i = 0; i < od_results.count; i++) {
-            object_detect_result *det_result = &(od_results.results[i]);
-            
-            // Only process if YOLO found a Person (COCO Class 0)
-            if (det_result->cls_id == 0) {
-                
-                // 1. ALIGN coordinates to multiples of 4 to keep the RGA hardware accelerator happy (Fixes Performance)
-                // Change (~3) to (~15) to guarantee 16-pixel alignment
-                int x1 = std::max(0, det_result->box.left) & (~15);
-                int y1 = std::max(0, det_result->box.top) & (~15);
-                int x2 = std::min(rgb_frame.cols - 1, det_result->box.right);
-                int y2 = std::min(rgb_frame.rows - 1, det_result->box.bottom);
-
-                int crop_w = (x2 - x1) & (~15); 
-                int crop_h = (y2 - y1) & (~15);
-
-                if (crop_w <= 0 || crop_h <= 0) continue;
-
-                // 2. CLONE the crop so the memory is contiguous (Fixes 0 Detections)
-                cv::Mat person_crop = rgb_frame(cv::Rect(x1, y1, crop_w, crop_h)).clone();
-
-                image_buffer_t crop_img;
-                memset(&crop_img, 0, sizeof(image_buffer_t));
-                crop_img.width = person_crop.cols;
-                crop_img.height = person_crop.rows;
-                crop_img.width_stride = person_crop.cols; // This is now accurate because of .clone()
-                crop_img.height_stride = person_crop.rows;
-                crop_img.format = IMAGE_FORMAT_RGB888; 
-                crop_img.virt_addr = person_crop.data; 
-                crop_img.size = person_crop.total() * person_crop.channels();
-
-                retinaface_result retina_res;
-                inference_retinaface_model(&retina_ctxs[0], &crop_img, &retina_res);
-
-                for (int f = 0; f < retina_res.count; f++) {
-                    if (retina_res.object[f].score > 0.5) { 
-                        for (int p = 0; p < 5; p++) {
-                            // Coordinate Translation: Map crop points back to global video frame
-                            int global_x = x1 + retina_res.object[f].ponit[p].x;
-                            int global_y = y1 + retina_res.object[f].ponit[p].y;
-                            
-                            // Draw Orange circles on facial features
-                            cv::circle(bgr_frame, cv::Point(global_x, global_y), 4, cv::Scalar(0, 165, 255), -1);
-                        }
-                    }
-                }
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            if (yolo_queue.size() >= max_yolo_queue_size) {
+                FramePacket dropped = std::move(yolo_queue.front());
+                yolo_queue.pop_front();
+                printf("%s[drop][capture][frame-%zu] yolo backlog full, dropping oldest frame%s\n",
+                       LOG_YELLOW, dropped.seq, LOG_RESET);
             }
-            
-            // Draw YOLO Person Box
-            cv::rectangle(bgr_frame, cv::Point(det_result->box.left, det_result->box.top), 
-                          cv::Point(det_result->box.right, det_result->box.bottom), cv::Scalar(0, 255, 0), 2);
-            char text[256];
-            sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
-            cv::putText(bgr_frame, text, cv::Point(det_result->box.left, det_result->box.top - 10), 
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
+            yolo_queue.push_back(std::move(packet));
         }
-        
-        double t3_ocr = get_current_time_ms(); 
-
-        writer.write(bgr_frame);
-        
-        double t4_end = get_current_time_ms();
-
-        if (frame_count % 30 == 0) {
-            double prep_time = t1_prep - t0_start;
-            double detect_time = t2_detect - t1_prep;
-            double casc_time = t3_ocr - t2_detect;
-            double post_time = t4_end - t3_ocr;
-            double total_time = t4_end - t0_start;
-            
-            printf("Frame %4d | Total: %5.1fms | FPS: %4.1f | Prep: %4.1fms | YOLO: %4.1fms | Retina: %4.1fms | Encode: %4.1fms\n", 
-                   frame_count, total_time, 1000.0 / total_time, prep_time, detect_time, casc_time, post_time);
-        }
+        queue_cv.notify_all();
         frame_count++;
     }
 
+    capture_done.store(true);
+    queue_cv.notify_all();
+
+    for (auto &thread : yolo_threads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    for (auto &thread : retina_threads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    for (int i = 0; i < yolo_worker_count; ++i) {
+        release_yolo11_model(&yolo_contexts[i]);
+    }
+    for (int i = 0; i < retina_worker_count; ++i) {
+        release_retinaface_model(&retina_contexts[i]);
+    }
+
+    std::vector<size_t> ordered_keys;
+    ordered_keys.reserve(finished_frames.size());
+    for (const auto &entry : finished_frames) {
+        ordered_keys.push_back(entry.first);
+    }
+    std::sort(ordered_keys.begin(), ordered_keys.end());
+
+    double repack_start_ms = get_current_time_ms();
+    std::string out_pipeline = "appsrc ! videoconvert ! video/x-raw,format=NV12 ! mpph264enc ! h264parse ! mp4mux ! filesink location=output_cascaded.mp4";
+    cv::VideoWriter writer(out_pipeline, cv::CAP_GSTREAMER, 0, 30, cv::Size(w, h));
+    for (size_t seq : ordered_keys) {
+        writer.write(finished_frames[seq].bgr_frame);
+    }
+    double repack_ms = get_current_time_ms() - repack_start_ms;
+    log_stage_time(LOG_YELLOW, "repack", ordered_keys.size(), repack_ms);
+
     cap.release();
     writer.release();
+    flush_stage_time_logs();
     deinit_post_process();
-    for (int i = 0; i < 3; i++) {
-        release_yolo11_model(&yolo_ctxs[i]);
-        release_retinaface_model(&retina_ctxs[i]);
-    }
-    printf("\nFinished! Processed %d frames. Saved to 'output_cascaded.mp4'\n", frame_count);
+        printf("%s[summary] captured=%d finished=%zu source_read=%.2f ms clone=%.2f ms repack=%.2f ms%s\n",
+            LOG_CYAN, frame_count, finished_frames.size(), source_read_total_ms, clone_total_ms, repack_ms, LOG_RESET);
+    printf("Finished! Processed %d frames. Saved to 'output_cascaded.mp4'\n", frame_count);
     return 0;
 }
