@@ -50,6 +50,11 @@ static void log_stage_time(const char *color, const char *stage, size_t seq, int
 }
 
 struct AppConfig {
+    std::string source = "rtsp";
+    std::string rtsp_url = "rtsp://admin:admin@192.168.1.156:554/cam/realmonitor?channel=1&subtype=0";
+    std::string rtsp_transport = "tcp";
+    int rtsp_latency_ms = 200;
+    std::string camera_codec = "h264";
     int udp_port = 5000;
     size_t clip_frames = 150;
     size_t max_buffered_frames = 300;
@@ -246,7 +251,7 @@ static bool parse_double_arg(const char *value, double *out)
 
 static void print_usage(const char *program)
 {
-    printf("Usage: %s <yolo_model> <retina_model> [--udp-port 5000] [--clip-frames 150] [--max-buffered-frames 300] [--fps 10] [--output output_cascaded.mp4]\n", program);
+    printf("Usage: %s <yolo_model> <retina_model> [--source rtsp|udp] [--rtsp-url URL] [--rtsp-transport tcp|udp] [--rtsp-latency-ms 200] [--camera-codec h264|h265] [--udp-port 5000] [--clip-frames 150] [--max-buffered-frames 300] [--fps 10] [--output output_cascaded.mp4]\n", program);
 }
 
 static bool parse_config(int argc, char **argv, AppConfig *config)
@@ -256,10 +261,26 @@ static bool parse_config(int argc, char **argv, AppConfig *config)
     }
 
     for (int i = 3; i < argc; ++i) {
-        if (strcmp(argv[i], "--udp-port") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) {
+            config->source = argv[++i];
+        } else if (strcmp(argv[i], "--rtsp-url") == 0 && i + 1 < argc) {
+            config->rtsp_url = argv[++i];
+            config->source = "rtsp";
+        } else if (strcmp(argv[i], "--rtsp-transport") == 0 && i + 1 < argc) {
+            config->rtsp_transport = argv[++i];
+            config->source = "rtsp";
+        } else if (strcmp(argv[i], "--rtsp-latency-ms") == 0 && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], &config->rtsp_latency_ms)) {
+                return false;
+            }
+            config->source = "rtsp";
+        } else if (strcmp(argv[i], "--camera-codec") == 0 && i + 1 < argc) {
+            config->camera_codec = argv[++i];
+        } else if (strcmp(argv[i], "--udp-port") == 0 && i + 1 < argc) {
             if (!parse_int_arg(argv[++i], &config->udp_port)) {
                 return false;
             }
+            config->source = "udp";
         } else if (strcmp(argv[i], "--clip-frames") == 0 && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], &config->clip_frames)) {
                 return false;
@@ -279,6 +300,26 @@ static bool parse_config(int argc, char **argv, AppConfig *config)
         }
     }
 
+    if (config->source != "rtsp" && config->source != "udp") {
+        printf("--source must be 'rtsp' or 'udp'\n");
+        return false;
+    }
+    if (config->source == "rtsp" && config->rtsp_url.empty()) {
+        printf("--rtsp-url must not be empty when --source rtsp is used\n");
+        return false;
+    }
+    if (config->rtsp_transport != "tcp" && config->rtsp_transport != "udp") {
+        printf("--rtsp-transport must be 'tcp' or 'udp'\n");
+        return false;
+    }
+    if (config->rtsp_latency_ms < 0) {
+        printf("--rtsp-latency-ms must be >= 0\n");
+        return false;
+    }
+    if (config->camera_codec != "h264" && config->camera_codec != "h265") {
+        printf("--camera-codec must be 'h264' or 'h265'\n");
+        return false;
+    }
     if (config->udp_port <= 0 || config->udp_port > 65535) {
         printf("Invalid --udp-port: %d\n", config->udp_port);
         return false;
@@ -305,6 +346,28 @@ static bool parse_config(int argc, char **argv, AppConfig *config)
         return false;
     }
     return true;
+}
+
+static std::string build_input_pipeline(const AppConfig &config)
+{
+    std::string depay = "rtph264depay";
+    std::string parse = "h264parse";
+    if (config.camera_codec == "h265") {
+        depay = "rtph265depay";
+        parse = "h265parse";
+    }
+
+    if (config.source == "udp") {
+        return "udpsrc port=" + std::to_string(config.udp_port) +
+               " caps=\"video/mpegts, systemstream=(boolean)true, packetsize=(int)188\""
+               " ! tsdemux ! " + parse + " ! mppvideodec ! videoconvert ! video/x-raw,format=BGR"
+               " ! appsink drop=true max-buffers=1 sync=false";
+    }
+
+    return "rtspsrc location=\"" + config.rtsp_url + "\" latency=" + std::to_string(config.rtsp_latency_ms) +
+           " protocols=" + config.rtsp_transport +
+           " ! " + depay + " ! " + parse + " ! mppvideodec ! videoconvert ! video/x-raw,format=BGR"
+           " ! appsink drop=true max-buffers=1 sync=false";
 }
 
 static bool write_clip_mp4(const std::vector<RecordedFrame> &frames,
@@ -607,14 +670,11 @@ int main(int argc, char **argv)
 
     init_post_process();
 
-    std::string pipeline = "udpsrc port=" + std::to_string(config.udp_port) +
-                           " caps=\"video/mpegts, systemstream=(boolean)true, packetsize=(int)188\""
-                           " ! tsdemux ! h264parse ! mppvideodec ! videoconvert ! video/x-raw,format=BGR"
-                           " ! appsink drop=true max-buffers=1 sync=false";
+    std::string pipeline = build_input_pipeline(config);
 
     cv::VideoCapture cap(pipeline, cv::CAP_GSTREAMER);
     if (!cap.isOpened()) {
-        printf("Failed to open live UDP hardware video pipeline!\n");
+        printf("Failed to open live %s hardware video pipeline!\n", config.source.c_str());
         return -1;
     }
 
@@ -702,9 +762,11 @@ int main(int argc, char **argv)
     cv::Mat bgr_frame;
     size_t frame_count = 0;
 
-    printf("--- Starting Live UDP Cascaded Inference Loop ---\n");
-    printf("UDP port=%d clip_frames=%zu max_buffered_frames=%zu fps=%.2f output=%s\n",
-           config.udp_port, config.clip_frames, config.max_buffered_frames,
+    printf("--- Starting Live %s Cascaded Inference Loop ---\n", config.source.c_str());
+    printf("source=%s codec=%s rtsp_transport=%s rtsp_latency_ms=%d udp_port=%d clip_frames=%zu max_buffered_frames=%zu fps=%.2f output=%s\n",
+           config.source.c_str(), config.camera_codec.c_str(), config.rtsp_transport.c_str(),
+           config.rtsp_latency_ms, config.udp_port,
+           config.clip_frames, config.max_buffered_frames,
            config.output_fps, config.output_path.c_str());
 
     double source_read_total_ms = 0.0;
