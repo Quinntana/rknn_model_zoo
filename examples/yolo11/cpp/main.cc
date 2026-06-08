@@ -39,66 +39,9 @@ static const char *LOG_YELLOW = "\033[33m";
 static const char *LOG_BLUE = "\033[34m";
 static const char *LOG_CYAN = "\033[36m";
 
-struct StageBatchStats {
-    const char *color = LOG_RESET;
-    double sum_ms = 0.0;
-    size_t count = 0;
-    size_t first_seq = 0;
-    size_t last_seq = 0;
-};
-
-static std::mutex g_stage_log_mutex;
-static std::map<std::string, StageBatchStats> g_stage_log_stats;
-
-static image_buffer_t make_rgb_image_buffer(cv::Mat &frame)
+static void log_stage_time(const char *color, const char *stage, size_t seq, int worker_id, int ctx_id, double ms)
 {
-    image_buffer_t img;
-    memset(&img, 0, sizeof(image_buffer_t));
-    img.width = frame.cols;
-    img.height = frame.rows;
-    img.width_stride = frame.cols;
-    img.height_stride = frame.rows;
-    img.format = IMAGE_FORMAT_RGB888;
-    img.virt_addr = frame.data;
-    img.size = frame.total() * frame.channels();
-    return img;
-}
-
-static void log_stage_time(const char *color, const char *stage, size_t seq, double ms)
-{
-    const size_t batch_id = seq / 30;
-    const std::string key = std::string(stage) + "#" + std::to_string(batch_id);
-
-    std::lock_guard<std::mutex> lock(g_stage_log_mutex);
-    auto &stats = g_stage_log_stats[key];
-    if (stats.count == 0) {
-        stats.color = color;
-        stats.first_seq = seq;
-    }
-    stats.last_seq = seq;
-    stats.sum_ms += ms;
-    stats.count++;
-
-    if (stats.count == 30) {
-        printf("%s[%s][batch-%zu][frames-%zu-%zu] avg %.2f ms%s\n",
-               stats.color, stage, batch_id, stats.first_seq, stats.last_seq, stats.sum_ms / 30.0, LOG_RESET);
-        g_stage_log_stats.erase(key);
-    }
-}
-
-static void flush_stage_time_logs()
-{
-    std::lock_guard<std::mutex> lock(g_stage_log_mutex);
-    for (const auto &entry : g_stage_log_stats) {
-        const std::string &key = entry.first;
-        const StageBatchStats &stats = entry.second;
-        const size_t pos = key.find('#');
-        const std::string stage = key.substr(0, pos);
-        const std::string batch = key.substr(pos + 1);
-        printf("%s[%s][batch-%s][frames-%zu-%zu] avg %.2f ms%s\n",
-               stats.color, stage.c_str(), batch.c_str(), stats.first_seq, stats.last_seq, stats.sum_ms / stats.count, LOG_RESET);
-    }
-    g_stage_log_stats.clear();
+    printf("%s[%s][worker-%d][ctx-%d][frame-%zu] %.2f ms%s\n", color, stage, worker_id, ctx_id, seq, ms, LOG_RESET);
 }
 
 struct FramePacket {
@@ -108,6 +51,8 @@ struct FramePacket {
     object_detect_result_list od_results;
     double source_read_start_ms = 0.0;
     bool has_yolo = false;
+    bool has_retina = false;
+    bool dropped = false;
 };
 
 static void yolo_worker(rknn_app_context_t *yolo_ctx,
@@ -148,7 +93,15 @@ static void yolo_worker(rknn_app_context_t *yolo_ctx,
         double yolo_prep_start_ms = get_current_time_ms();
         cv::cvtColor(packet.bgr_frame, packet.rgb_frame, cv::COLOR_BGR2RGB);
 
-        image_buffer_t src_image = make_rgb_image_buffer(packet.rgb_frame);
+        image_buffer_t src_image;
+        memset(&src_image, 0, sizeof(image_buffer_t));
+        src_image.width = packet.rgb_frame.cols;
+        src_image.height = packet.rgb_frame.rows;
+        src_image.width_stride = packet.rgb_frame.cols;
+        src_image.height_stride = packet.rgb_frame.rows;
+        src_image.format = IMAGE_FORMAT_RGB888;
+        src_image.virt_addr = packet.rgb_frame.data;
+        src_image.size = packet.rgb_frame.total() * packet.rgb_frame.channels();
         double yolo_prep_ms = get_current_time_ms() - yolo_prep_start_ms;
 
         double yolo_npu_start_ms = get_current_time_ms();
@@ -161,8 +114,8 @@ static void yolo_worker(rknn_app_context_t *yolo_ctx,
         }
 
         packet.has_yolo = true;
-        log_stage_time(LOG_BLUE, "yolo-prep", packet.seq, yolo_prep_ms);
-        log_stage_time(LOG_GREEN, "yolo-npu", packet.seq, yolo_npu_ms);
+        log_stage_time(LOG_BLUE, "yolo-prep", packet.seq, worker_id, worker_id, yolo_prep_ms);
+        log_stage_time(LOG_GREEN, "yolo-npu", packet.seq, worker_id, worker_id, yolo_npu_ms);
 
         {
             std::unique_lock<std::mutex> lock(*queue_mutex);
@@ -232,7 +185,15 @@ static void retina_worker(retina_app_context_t *retina_ctx,
                     if (crop_w > 0 && crop_h > 0) {
                         cv::Mat person_crop = packet.rgb_frame(cv::Rect(x1, y1, crop_w, crop_h)).clone();
 
-                        image_buffer_t crop_img = make_rgb_image_buffer(person_crop);
+                        image_buffer_t crop_img;
+                        memset(&crop_img, 0, sizeof(image_buffer_t));
+                        crop_img.width = person_crop.cols;
+                        crop_img.height = person_crop.rows;
+                        crop_img.width_stride = person_crop.cols;
+                        crop_img.height_stride = person_crop.rows;
+                        crop_img.format = IMAGE_FORMAT_RGB888;
+                        crop_img.virt_addr = person_crop.data;
+                        crop_img.size = person_crop.total() * person_crop.channels();
 
                         retinaface_result retina_res;
                         int ret = inference_retinaface_model(retina_ctx, &crop_img, &retina_res);
@@ -255,7 +216,7 @@ static void retina_worker(retina_app_context_t *retina_ctx,
                 }
             }
             double retina_npu_ms = get_current_time_ms() - retina_npu_start_ms;
-            log_stage_time(LOG_CYAN, "retina-npu", packet.seq, retina_npu_ms);
+            log_stage_time(LOG_CYAN, "retina-npu", packet.seq, worker_id, worker_id, retina_npu_ms);
 
             retina_draw_start_ms = get_current_time_ms();
             for (int i = 0; i < packet.od_results.count; i++) {
@@ -273,16 +234,17 @@ static void retina_worker(retina_app_context_t *retina_ctx,
             }
         }
 
+        packet.has_retina = true;
         double retina_draw_ms = 0.0;
         if (retina_draw_start_ms > 0.0) {
             retina_draw_ms = get_current_time_ms() - retina_draw_start_ms;
-            log_stage_time(LOG_BLUE, "retina-draw", packet.seq, retina_draw_ms);
+            log_stage_time(LOG_BLUE, "retina-draw", packet.seq, worker_id, worker_id, retina_draw_ms);
         }
 
         double end_to_end_ms = 0.0;
         if (packet.source_read_start_ms > 0.0) {
             end_to_end_ms = get_current_time_ms() - packet.source_read_start_ms;
-            log_stage_time(LOG_YELLOW, "e2e", packet.seq, end_to_end_ms);
+            log_stage_time(LOG_YELLOW, "e2e", packet.seq, worker_id, worker_id, end_to_end_ms);
         }
 
         {
@@ -343,7 +305,7 @@ int main(int argc, char **argv)
             }
             return -1;
         }
-        rknn_set_core_mask(yolo_contexts[i].rknn_ctx, RKNN_NPU_CORE_AUTO);
+        rknn_set_core_mask(yolo_contexts[i].rknn_ctx, RKNN_NPU_CORE_0_1_2);
         ret = rknn_set_batch_core_num(yolo_contexts[i].rknn_ctx, 3);
         if (ret != RKNN_SUCC) {
             printf("rknn_set_batch_core_num(yolo-%d) fail! ret=%d\n", i, ret);
@@ -361,7 +323,7 @@ int main(int argc, char **argv)
             }
             return -1;
         }
-        rknn_set_core_mask(retina_contexts[i].rknn_ctx, RKNN_NPU_CORE_AUTO);
+        rknn_set_core_mask(retina_contexts[i].rknn_ctx, RKNN_NPU_CORE_0_1_2);
         ret = rknn_set_batch_core_num(retina_contexts[i].rknn_ctx, 3);
         if (ret != RKNN_SUCC) {
             printf("rknn_set_batch_core_num(retina-%d) fail! ret=%d\n", i, ret);
@@ -414,7 +376,7 @@ int main(int argc, char **argv)
         }
         double source_read_ms = get_current_time_ms() - source_read_start_ms;
         source_read_total_ms += source_read_ms;
-        log_stage_time(LOG_RED, "source-read", frame_count, source_read_ms);
+        log_stage_time(LOG_RED, "source-read", frame_count, 0, 0, source_read_ms);
 
         double clone_start_ms = get_current_time_ms();
         FramePacket packet;
@@ -423,7 +385,7 @@ int main(int argc, char **argv)
         packet.bgr_frame = bgr_frame.clone();
         double clone_ms = get_current_time_ms() - clone_start_ms;
         clone_total_ms += clone_ms;
-        log_stage_time(LOG_BLUE, "capture-clone", packet.seq, clone_ms);
+        log_stage_time(LOG_BLUE, "capture-clone", packet.seq, 0, 0, clone_ms);
 
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
@@ -469,16 +431,15 @@ int main(int argc, char **argv)
 
     double repack_start_ms = get_current_time_ms();
     std::string out_pipeline = "appsrc ! videoconvert ! video/x-raw,format=NV12 ! mpph264enc ! h264parse ! mp4mux ! filesink location=output_cascaded.mp4";
-    cv::VideoWriter writer(out_pipeline, cv::CAP_GSTREAMER, 0, 30, cv::Size(w, h));
+    cv::VideoWriter writer(out_pipeline, cv::CAP_GSTREAMER, 0, 10, cv::Size(w, h));
     for (size_t seq : ordered_keys) {
         writer.write(finished_frames[seq].bgr_frame);
     }
     double repack_ms = get_current_time_ms() - repack_start_ms;
-    log_stage_time(LOG_YELLOW, "repack", ordered_keys.size(), repack_ms);
+    log_stage_time(LOG_YELLOW, "repack", ordered_keys.size(), 0, 0, repack_ms);
 
     cap.release();
     writer.release();
-    flush_stage_time_logs();
     deinit_post_process();
         printf("%s[summary] captured=%d finished=%zu source_read=%.2f ms clone=%.2f ms repack=%.2f ms%s\n",
             LOG_CYAN, frame_count, finished_frames.size(), source_read_total_ms, clone_total_ms, repack_ms, LOG_RESET);
