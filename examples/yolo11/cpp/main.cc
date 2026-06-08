@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/select.h>
+#include <termios.h>
+#include <unistd.h>
 #include <sys/time.h>
 #include <string>
 #include <algorithm> // Needed for std::max / std::min
@@ -12,6 +16,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 #include <thread>
 
@@ -44,6 +49,14 @@ static void log_stage_time(const char *color, const char *stage, size_t seq, int
     printf("%s[%s][worker-%d][ctx-%d][frame-%zu] %.2f ms%s\n", color, stage, worker_id, ctx_id, seq, ms, LOG_RESET);
 }
 
+struct AppConfig {
+    int udp_port = 5000;
+    size_t clip_frames = 150;
+    size_t max_buffered_frames = 300;
+    double output_fps = 10.0;
+    std::string output_path = "output_cascaded.mp4";
+};
+
 struct FramePacket {
     size_t seq = 0;
     cv::Mat bgr_frame;
@@ -55,6 +68,330 @@ struct FramePacket {
     bool dropped = false;
 };
 
+struct RecordedFrame {
+    size_t seq = 0;
+    cv::Mat bgr_frame;
+};
+
+class RecorderBuffer {
+public:
+    RecorderBuffer(size_t max_buffered_frames, size_t max_reorder_pending)
+        : max_buffered_frames_(max_buffered_frames),
+          max_reorder_pending_(max_reorder_pending)
+    {
+    }
+
+    void add_completed(size_t seq, cv::Mat bgr_frame)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (seq < next_seq_) {
+            return;
+        }
+        pending_[seq] = RecordedFrame{seq, std::move(bgr_frame)};
+        flush_locked();
+    }
+
+    void mark_dropped(size_t seq)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (seq < next_seq_) {
+            return;
+        }
+        dropped_.insert(seq);
+        flush_locked();
+    }
+
+    std::vector<RecordedFrame> snapshot_last(size_t frame_count)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<RecordedFrame> frames;
+        if (ring_.empty()) {
+            return frames;
+        }
+
+        size_t copy_count = std::min(frame_count, ring_.size());
+        frames.reserve(copy_count);
+        size_t start = ring_.size() - copy_count;
+        for (size_t i = start; i < ring_.size(); ++i) {
+            frames.push_back(RecordedFrame{ring_[i].seq, ring_[i].bgr_frame.clone()});
+        }
+        return frames;
+    }
+
+    size_t buffered_count()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ring_.size();
+    }
+
+private:
+    void flush_locked()
+    {
+        while (true) {
+            auto pending_it = pending_.find(next_seq_);
+            if (pending_it != pending_.end()) {
+                ring_.push_back(std::move(pending_it->second));
+                pending_.erase(pending_it);
+                next_seq_++;
+                while (ring_.size() > max_buffered_frames_) {
+                    ring_.pop_front();
+                }
+                continue;
+            }
+
+            auto dropped_it = dropped_.find(next_seq_);
+            if (dropped_it != dropped_.end()) {
+                dropped_.erase(dropped_it);
+                next_seq_++;
+                continue;
+            }
+
+            if (pending_.size() > max_reorder_pending_ && !pending_.empty()) {
+                size_t lowest_pending_seq = pending_.begin()->first;
+                printf("%s[recorder][reorder] skipping missing frames %zu-%zu to avoid reorder stall%s\n",
+                       LOG_YELLOW, next_seq_, lowest_pending_seq - 1, LOG_RESET);
+                next_seq_ = lowest_pending_seq;
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    std::mutex mutex_;
+    std::map<size_t, RecordedFrame> pending_;
+    std::set<size_t> dropped_;
+    std::deque<RecordedFrame> ring_;
+    size_t next_seq_ = 0;
+    size_t max_buffered_frames_ = 0;
+    size_t max_reorder_pending_ = 0;
+};
+
+class TerminalModeGuard {
+public:
+    TerminalModeGuard()
+    {
+        enabled_ = isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &old_term_) == 0;
+        if (!enabled_) {
+            return;
+        }
+
+        struct termios new_term = old_term_;
+        new_term.c_lflag &= ~(ICANON | ECHO);
+        new_term.c_cc[VMIN] = 0;
+        new_term.c_cc[VTIME] = 0;
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &new_term) != 0) {
+            enabled_ = false;
+        }
+    }
+
+    ~TerminalModeGuard()
+    {
+        restore();
+    }
+
+    void restore()
+    {
+        if (enabled_) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &old_term_);
+            enabled_ = false;
+        }
+    }
+
+    bool enabled() const
+    {
+        return enabled_;
+    }
+
+private:
+    bool enabled_ = false;
+    struct termios old_term_;
+};
+
+static bool parse_int_arg(const char *value, int *out)
+{
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        return false;
+    }
+    *out = (int)parsed;
+    return true;
+}
+
+static bool parse_size_arg(const char *value, size_t *out)
+{
+    char *end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        return false;
+    }
+    *out = (size_t)parsed;
+    return true;
+}
+
+static bool parse_double_arg(const char *value, double *out)
+{
+    char *end = NULL;
+    errno = 0;
+    double parsed = strtod(value, &end);
+    if (errno != 0 || end == value || *end != '\0') {
+        return false;
+    }
+    *out = parsed;
+    return true;
+}
+
+static void print_usage(const char *program)
+{
+    printf("Usage: %s <yolo_model> <retina_model> [--udp-port 5000] [--clip-frames 150] [--max-buffered-frames 300] [--fps 10] [--output output_cascaded.mp4]\n", program);
+}
+
+static bool parse_config(int argc, char **argv, AppConfig *config)
+{
+    if (argc < 3) {
+        return false;
+    }
+
+    for (int i = 3; i < argc; ++i) {
+        if (strcmp(argv[i], "--udp-port") == 0 && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], &config->udp_port)) {
+                return false;
+            }
+        } else if (strcmp(argv[i], "--clip-frames") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], &config->clip_frames)) {
+                return false;
+            }
+        } else if (strcmp(argv[i], "--max-buffered-frames") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], &config->max_buffered_frames)) {
+                return false;
+            }
+        } else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
+            if (!parse_double_arg(argv[++i], &config->output_fps)) {
+                return false;
+            }
+        } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+            config->output_path = argv[++i];
+        } else {
+            return false;
+        }
+    }
+
+    if (config->udp_port <= 0 || config->udp_port > 65535) {
+        printf("Invalid --udp-port: %d\n", config->udp_port);
+        return false;
+    }
+    if (config->clip_frames == 0) {
+        printf("--clip-frames must be greater than 0\n");
+        return false;
+    }
+    if (config->max_buffered_frames == 0) {
+        printf("--max-buffered-frames must be greater than 0\n");
+        return false;
+    }
+    if (config->clip_frames > config->max_buffered_frames) {
+        printf("--clip-frames (%zu) must be <= --max-buffered-frames (%zu)\n",
+               config->clip_frames, config->max_buffered_frames);
+        return false;
+    }
+    if (config->output_fps <= 0.0) {
+        printf("--fps must be greater than 0\n");
+        return false;
+    }
+    if (config->output_path.empty()) {
+        printf("--output must not be empty\n");
+        return false;
+    }
+    return true;
+}
+
+static bool write_clip_mp4(const std::vector<RecordedFrame> &frames,
+                           const std::string &output_path,
+                           double fps)
+{
+    if (frames.empty()) {
+        printf("%s[save] no processed frames buffered yet%s\n", LOG_YELLOW, LOG_RESET);
+        return false;
+    }
+
+    cv::Size frame_size(frames[0].bgr_frame.cols, frames[0].bgr_frame.rows);
+    if (frame_size.width <= 0 || frame_size.height <= 0) {
+        printf("%s[save] buffered frame has invalid size%s\n", LOG_RED, LOG_RESET);
+        return false;
+    }
+
+    std::string tmp_path = output_path + ".tmp";
+    remove(tmp_path.c_str());
+
+    double start_ms = get_current_time_ms();
+    std::string out_pipeline = "appsrc ! videoconvert ! video/x-raw,format=NV12 ! mpph264enc ! h264parse ! mp4mux ! filesink location=" + tmp_path;
+    cv::VideoWriter writer(out_pipeline, cv::CAP_GSTREAMER, 0, fps, frame_size);
+    if (!writer.isOpened()) {
+        printf("%s[save] failed to open writer pipeline for %s%s\n", LOG_RED, tmp_path.c_str(), LOG_RESET);
+        return false;
+    }
+
+    for (const RecordedFrame &frame : frames) {
+        writer.write(frame.bgr_frame);
+    }
+    writer.release();
+
+    if (rename(tmp_path.c_str(), output_path.c_str()) != 0) {
+        printf("%s[save] failed to rename %s to %s: %s%s\n",
+               LOG_RED, tmp_path.c_str(), output_path.c_str(), strerror(errno), LOG_RESET);
+        return false;
+    }
+
+    double save_ms = get_current_time_ms() - start_ms;
+    printf("%s[save] wrote %zu frames to %s at %.2f fps in %.2f ms%s\n",
+           LOG_CYAN, frames.size(), output_path.c_str(), fps, save_ms, LOG_RESET);
+    return true;
+}
+
+static void input_worker(std::atomic<bool> *stop_requested,
+                         std::atomic<int> *save_requests,
+                         std::condition_variable *queue_cv,
+                         const std::string output_path)
+{
+    TerminalModeGuard terminal_guard;
+    if (!terminal_guard.enabled()) {
+        printf("%s[input] stdin is not a TTY; keyboard trigger disabled%s\n", LOG_YELLOW, LOG_RESET);
+        return;
+    }
+
+    printf("%s[input] press 's' to save %s, 'q' to quit%s\n",
+           LOG_CYAN, output_path.c_str(), LOG_RESET);
+    while (!stop_requested->load()) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+        struct timeval timeout;
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 100000;
+
+        int ready = select(STDIN_FILENO + 1, &readfds, NULL, NULL, &timeout);
+        if (ready <= 0) {
+            continue;
+        }
+
+        char ch = 0;
+        ssize_t bytes_read = read(STDIN_FILENO, &ch, 1);
+        if (bytes_read <= 0) {
+            continue;
+        }
+
+        if (ch == 's' || ch == 'S') {
+            save_requests->fetch_add(1);
+        } else if (ch == 'q' || ch == 'Q') {
+            stop_requested->store(true);
+            queue_cv->notify_all();
+            break;
+        }
+    }
+}
+
 static void yolo_worker(rknn_app_context_t *yolo_ctx,
                         std::deque<FramePacket> *input_queue,
                         std::deque<FramePacket> *retina_queue,
@@ -62,6 +399,7 @@ static void yolo_worker(rknn_app_context_t *yolo_ctx,
                         std::condition_variable *queue_cv,
                         std::atomic<bool> *capture_done,
                         std::atomic<bool> *stop_requested,
+                        RecorderBuffer *recorder,
                         size_t max_retina_queue_size,
                         int worker_id)
 {
@@ -122,6 +460,7 @@ static void yolo_worker(rknn_app_context_t *yolo_ctx,
             if (retina_queue->size() >= max_retina_queue_size) {
                 FramePacket dropped = std::move(retina_queue->front());
                 retina_queue->pop_front();
+                recorder->mark_dropped(dropped.seq);
                 printf("%s[drop][worker-%d][frame-%zu] retina backlog full, dropping oldest frame%s\n",
                        LOG_YELLOW, worker_id, dropped.seq, LOG_RESET);
             }
@@ -137,7 +476,7 @@ static void retina_worker(retina_app_context_t *retina_ctx,
                           std::condition_variable *queue_cv,
                           std::atomic<bool> *capture_done,
                           std::atomic<bool> *stop_requested,
-                          std::map<size_t, FramePacket> *finished_frames,
+                          RecorderBuffer *recorder,
                           int worker_id)
 {
     while (true) {
@@ -248,8 +587,7 @@ static void retina_worker(retina_app_context_t *retina_ctx,
         }
 
         {
-            std::lock_guard<std::mutex> lock(*queue_mutex);
-            (*finished_frames)[packet.seq] = std::move(packet);
+            recorder->add_completed(packet.seq, std::move(packet.bgr_frame));
         }
         queue_cv->notify_all();
     }
@@ -257,29 +595,28 @@ static void retina_worker(retina_app_context_t *retina_ctx,
 
 int main(int argc, char **argv)
 {
-    if (argc != 4) {
-        printf("Usage: %s <yolo_model> <retina_model> <video_path>\n", argv[0]);
+    AppConfig config;
+    if (!parse_config(argc, argv, &config)) {
+        print_usage(argv[0]);
         return -1;
     }
 
     const char *yolo_path = argv[1];
     const char *retina_path = argv[2];
-    const char *video_path = argv[3];
     int ret;
 
     init_post_process();
 
-    std::string pipeline = "filesrc location=" + std::string(video_path) + 
-                           " ! qtdemux ! h264parse ! mppvideodec ! videoconvert ! video/x-raw,format=BGR ! appsink drop=true max-buffers=1";
+    std::string pipeline = "udpsrc port=" + std::to_string(config.udp_port) +
+                           " caps=\"video/mpegts, systemstream=(boolean)true, packetsize=(int)188\""
+                           " ! tsdemux ! h264parse ! mppvideodec ! videoconvert ! video/x-raw,format=BGR"
+                           " ! appsink drop=true max-buffers=1 sync=false";
 
     cv::VideoCapture cap(pipeline, cv::CAP_GSTREAMER);
     if (!cap.isOpened()) {
-        printf("Failed to open hardware video pipeline!\n");
+        printf("Failed to open live UDP hardware video pipeline!\n");
         return -1;
     }
-
-    int w = cap.get(cv::CAP_PROP_FRAME_WIDTH);
-    int h = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
 
     std::deque<FramePacket> yolo_queue;
     std::deque<FramePacket> retina_queue;
@@ -287,12 +624,13 @@ int main(int argc, char **argv)
     std::condition_variable queue_cv;
     std::atomic<bool> capture_done(false);
     std::atomic<bool> stop_requested(false);
-    std::map<size_t, FramePacket> finished_frames;
+    std::atomic<int> save_requests(0);
     const size_t max_yolo_queue_size = 4;
     const size_t max_retina_queue_size = 8;
     const int yolo_worker_count = 3;
     const int retina_worker_count = 3;
-    const int max_frames = 100;
+    const size_t max_reorder_pending = max_retina_queue_size + retina_worker_count + 8;
+    RecorderBuffer recorder(config.max_buffered_frames, max_reorder_pending);
 
     std::vector<rknn_app_context_t> yolo_contexts(yolo_worker_count);
     std::vector<retina_app_context_t> retina_contexts(retina_worker_count);
@@ -343,6 +681,7 @@ int main(int argc, char **argv)
                                   &queue_cv,
                                   &capture_done,
                                   &stop_requested,
+                                  &recorder,
                                   max_retina_queue_size,
                                   i);
     }
@@ -354,24 +693,36 @@ int main(int argc, char **argv)
                                     &queue_cv,
                                     &capture_done,
                                     &stop_requested,
-                                    &finished_frames,
+                                    &recorder,
                                     i);
     }
 
-    cv::Mat bgr_frame;
-    int frame_count = 0;
+    std::thread input_thread(input_worker, &stop_requested, &save_requests, &queue_cv, config.output_path);
 
-    printf("--- Starting Real-Time Cascaded Inference Loop ---\n");
+    cv::Mat bgr_frame;
+    size_t frame_count = 0;
+
+    printf("--- Starting Live UDP Cascaded Inference Loop ---\n");
+    printf("UDP port=%d clip_frames=%zu max_buffered_frames=%zu fps=%.2f output=%s\n",
+           config.udp_port, config.clip_frames, config.max_buffered_frames,
+           config.output_fps, config.output_path.c_str());
 
     double source_read_total_ms = 0.0;
     double clone_total_ms = 0.0;
     while (true) {
-        if (stop_requested.load() || frame_count >= max_frames) {
+        if (stop_requested.load()) {
             break;
+        }
+
+        int pending_saves = save_requests.exchange(0);
+        for (int i = 0; i < pending_saves; ++i) {
+            std::vector<RecordedFrame> frames = recorder.snapshot_last(config.clip_frames);
+            write_clip_mp4(frames, config.output_path, config.output_fps);
         }
 
         double source_read_start_ms = get_current_time_ms();
         if (!cap.read(bgr_frame)) {
+            printf("%s[capture] failed to read live frame; exiting%s\n", LOG_RED, LOG_RESET);
             break;
         }
         double source_read_ms = get_current_time_ms() - source_read_start_ms;
@@ -392,6 +743,7 @@ int main(int argc, char **argv)
             if (yolo_queue.size() >= max_yolo_queue_size) {
                 FramePacket dropped = std::move(yolo_queue.front());
                 yolo_queue.pop_front();
+                recorder.mark_dropped(dropped.seq);
                 printf("%s[drop][capture][frame-%zu] yolo backlog full, dropping oldest frame%s\n",
                        LOG_YELLOW, dropped.seq, LOG_RESET);
             }
@@ -402,8 +754,18 @@ int main(int argc, char **argv)
     }
 
     capture_done.store(true);
+    stop_requested.store(true);
     queue_cv.notify_all();
 
+    int pending_saves = save_requests.exchange(0);
+    for (int i = 0; i < pending_saves; ++i) {
+        std::vector<RecordedFrame> frames = recorder.snapshot_last(config.clip_frames);
+        write_clip_mp4(frames, config.output_path, config.output_fps);
+    }
+
+    if (input_thread.joinable()) {
+        input_thread.join();
+    }
     for (auto &thread : yolo_threads) {
         if (thread.joinable()) {
             thread.join();
@@ -422,27 +784,10 @@ int main(int argc, char **argv)
         release_retinaface_model(&retina_contexts[i]);
     }
 
-    std::vector<size_t> ordered_keys;
-    ordered_keys.reserve(finished_frames.size());
-    for (const auto &entry : finished_frames) {
-        ordered_keys.push_back(entry.first);
-    }
-    std::sort(ordered_keys.begin(), ordered_keys.end());
-
-    double repack_start_ms = get_current_time_ms();
-    std::string out_pipeline = "appsrc ! videoconvert ! video/x-raw,format=NV12 ! mpph264enc ! h264parse ! mp4mux ! filesink location=output_cascaded.mp4";
-    cv::VideoWriter writer(out_pipeline, cv::CAP_GSTREAMER, 0, 10, cv::Size(w, h));
-    for (size_t seq : ordered_keys) {
-        writer.write(finished_frames[seq].bgr_frame);
-    }
-    double repack_ms = get_current_time_ms() - repack_start_ms;
-    log_stage_time(LOG_YELLOW, "repack", ordered_keys.size(), 0, 0, repack_ms);
-
     cap.release();
-    writer.release();
     deinit_post_process();
-        printf("%s[summary] captured=%d finished=%zu source_read=%.2f ms clone=%.2f ms repack=%.2f ms%s\n",
-            LOG_CYAN, frame_count, finished_frames.size(), source_read_total_ms, clone_total_ms, repack_ms, LOG_RESET);
-    printf("Finished! Processed %d frames. Saved to 'output_cascaded.mp4'\n", frame_count);
+    printf("%s[summary] captured=%zu buffered=%zu source_read=%.2f ms clone=%.2f ms%s\n",
+           LOG_CYAN, frame_count, recorder.buffered_count(), source_read_total_ms, clone_total_ms, LOG_RESET);
+    printf("Finished! Last saved clip path: '%s'\n", config.output_path.c_str());
     return 0;
 }
