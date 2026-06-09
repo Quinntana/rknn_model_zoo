@@ -14,6 +14,8 @@ typedef struct {
     int model_channel;
     int model_width;
     int model_height;
+    bool collect_perf;
+    int64_t last_perf_run_us;
 } retina_app_context_t;
 
 typedef struct box_rect_t {
@@ -40,7 +42,7 @@ typedef struct {
     retinaface_object_t object[128];
 } retinaface_result;
 
-int init_retinaface_model(const char *model_path, retina_app_context_t *app_ctx);
+int init_retinaface_model(const char *model_path, retina_app_context_t *app_ctx, uint32_t init_flags = RKNN_FLAG_ENABLE_SRAM);
 
 int release_retinaface_model(retina_app_context_t *app_ctx);
 

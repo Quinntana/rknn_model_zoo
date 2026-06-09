@@ -36,7 +36,7 @@ static void dump_tensor_attr(rknn_tensor_attr *attr) {
            attr->scale);
 }
 
-int init_yolo11_model(const char *model_path, rknn_app_context_t *app_ctx) {
+int init_yolo11_model(const char *model_path, rknn_app_context_t *app_ctx, uint32_t init_flags) {
     int ret;
     int model_len = 0;
     char *model;
@@ -49,7 +49,7 @@ int init_yolo11_model(const char *model_path, rknn_app_context_t *app_ctx) {
         return -1;
     }
 
-    ret = rknn_init(&ctx, model, model_len, 0, NULL);
+    ret = rknn_init(&ctx, model, model_len, init_flags, NULL);
     free(model);
     if (ret < 0) {
         printf("rknn_init fail! ret=%d\n", ret);
@@ -148,6 +148,8 @@ int init_yolo11_model(const char *model_path, rknn_app_context_t *app_ctx) {
     }
 
     app_ctx->io_num = io_num;
+    app_ctx->collect_perf = false;
+    app_ctx->last_perf_run_us = -1;
     app_ctx->input_attrs = (rknn_tensor_attr *)malloc(io_num.n_input * sizeof(rknn_tensor_attr));
     memcpy(app_ctx->input_attrs, input_attrs, io_num.n_input * sizeof(rknn_tensor_attr));
     app_ctx->output_attrs = (rknn_tensor_attr *)malloc(io_num.n_output * sizeof(rknn_tensor_attr));

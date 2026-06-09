@@ -47,6 +47,8 @@ typedef struct {
     int model_width;
     int model_height;
     bool is_quant;
+    bool collect_perf;
+    int64_t last_perf_run_us;
 
     unsigned char* preprocess_buf;
 } rknn_app_context_t;
@@ -54,7 +56,7 @@ typedef struct {
 #include "postprocess.h"
 
 
-int init_yolo11_model(const char* model_path, rknn_app_context_t* app_ctx);
+int init_yolo11_model(const char* model_path, rknn_app_context_t* app_ctx, uint32_t init_flags = RKNN_FLAG_ENABLE_SRAM);
 
 int release_yolo11_model(rknn_app_context_t* app_ctx);
 
