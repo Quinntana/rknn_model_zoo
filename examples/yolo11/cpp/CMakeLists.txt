@@ -39,6 +39,9 @@ file(GLOB SRCS ${CMAKE_CURRENT_SOURCE_DIR}/*.cc)
 
 add_executable(${PROJECT_NAME}
     main.cc
+    app_config.cc
+    runtime_state.cc
+    worker_threads.cc
     postprocess.cc
     retinaface.cc
     ${rknpu_yolo11_file}
@@ -78,6 +81,9 @@ if (NOT (TARGET_SOC STREQUAL "rv1106" OR TARGET_SOC STREQUAL "rv1103" OR TARGET_
     OR TARGET_SOC STREQUAL "rv1109" OR TARGET_SOC STREQUAL "rv1126" OR TARGET_SOC STREQUAL "rv1103b"))
     add_executable(${PROJECT_NAME}_zero_copy
         main.cc
+        app_config.cc
+        runtime_state.cc
+        worker_threads.cc
         postprocess.cc
         retinaface.cc
         rknpu2/yolo11_zero_copy.cc
