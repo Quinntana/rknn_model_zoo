@@ -51,15 +51,22 @@ static void log_stage_time(const char *color, const char *stage, size_t seq, int
 
 struct AppConfig {
     std::string source = "rtsp";
-    std::string rtsp_url = "rtsp://admin:admin@192.168.1.156:554/cam/realmonitor?channel=1&subtype=0";
+    std::string rtsp_url = "rtsp://admin:admin@192.168.1.156:554/stream1";
     std::string rtsp_transport = "tcp";
     int rtsp_latency_ms = 200;
     std::string camera_codec = "h264";
     int udp_port = 5000;
     size_t clip_frames = 150;
     size_t max_buffered_frames = 300;
-    double output_fps = 10.0;
+    double output_fps = 25.0;
     std::string output_path = "output_cascaded.mp4";
+    int yolo_worker_count = 1;
+    int retina_worker_count = 1;
+    size_t max_yolo_queue_size = 1;
+    size_t max_retina_queue_size = 2;
+    int yolo_interval = 1;
+    int min_retina_crop_size = 64;
+    int max_retina_crops = 4;
 };
 
 struct FramePacket {
@@ -67,7 +74,7 @@ struct FramePacket {
     cv::Mat bgr_frame;
     cv::Mat rgb_frame;
     object_detect_result_list od_results;
-    double source_read_start_ms = 0.0;
+    double processing_start_ms = 0.0;
     bool has_yolo = false;
     bool has_retina = false;
     bool dropped = false;
@@ -77,6 +84,120 @@ struct RecordedFrame {
     size_t seq = 0;
     cv::Mat bgr_frame;
 };
+
+struct RuntimeStats {
+    std::atomic<size_t> yolo_processed{0};
+    std::atomic<size_t> processed_frames{0};
+    std::atomic<size_t> yolo_queue_drops{0};
+    std::atomic<size_t> retina_queue_drops{0};
+    std::atomic<size_t> interval_reuse_frames{0};
+    std::atomic<size_t> retina_crops_run{0};
+    std::atomic<size_t> retina_crops_skipped_small{0};
+    std::atomic<size_t> retina_crops_skipped_limit{0};
+};
+
+struct TimingSnapshot {
+    size_t count = 0;
+    double avg_ms = 0.0;
+    double p50_ms = 0.0;
+    double p95_ms = 0.0;
+};
+
+class RollingTiming {
+public:
+    explicit RollingTiming(size_t max_samples = 256)
+        : max_samples_(max_samples)
+    {
+    }
+
+    void add(double ms)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        samples_.push_back(ms);
+        while (samples_.size() > max_samples_) {
+            samples_.pop_front();
+        }
+    }
+
+    TimingSnapshot snapshot()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        TimingSnapshot snap;
+        snap.count = samples_.size();
+        if (samples_.empty()) {
+            return snap;
+        }
+
+        std::vector<double> sorted(samples_.begin(), samples_.end());
+        std::sort(sorted.begin(), sorted.end());
+        double total = 0.0;
+        for (double sample : sorted) {
+            total += sample;
+        }
+
+        snap.avg_ms = total / sorted.size();
+        snap.p50_ms = percentile(sorted, 0.50);
+        snap.p95_ms = percentile(sorted, 0.95);
+        return snap;
+    }
+
+private:
+    static double percentile(const std::vector<double> &sorted, double pct)
+    {
+        if (sorted.empty()) {
+            return 0.0;
+        }
+        size_t index = (size_t)((sorted.size() - 1) * pct + 0.5);
+        index = std::min(index, sorted.size() - 1);
+        return sorted[index];
+    }
+
+    std::mutex mutex_;
+    std::deque<double> samples_;
+    size_t max_samples_ = 0;
+};
+
+class DetectionCache {
+public:
+    void update(const object_detect_result_list &od_results)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        od_results_ = od_results;
+        valid_ = true;
+    }
+
+    bool snapshot(object_detect_result_list *od_results)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!valid_) {
+            return false;
+        }
+        *od_results = od_results_;
+        return true;
+    }
+
+private:
+    std::mutex mutex_;
+    object_detect_result_list od_results_;
+    bool valid_ = false;
+};
+
+static void draw_yolo_results(cv::Mat *bgr_frame, const object_detect_result_list &od_results)
+{
+    for (int i = 0; i < od_results.count; i++) {
+        const object_detect_result *det_result = &(od_results.results[i]);
+
+        cv::rectangle(*bgr_frame,
+                      cv::Point(det_result->box.left, det_result->box.top),
+                      cv::Point(det_result->box.right, det_result->box.bottom),
+                      cv::Scalar(0, 255, 0), 2);
+        char text[256];
+        sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
+        cv::putText(*bgr_frame, text,
+                    cv::Point(det_result->box.left, det_result->box.top - 10),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
+    }
+}
 
 class RecorderBuffer {
 public:
@@ -251,7 +372,7 @@ static bool parse_double_arg(const char *value, double *out)
 
 static void print_usage(const char *program)
 {
-    printf("Usage: %s <yolo_model> <retina_model> [--source rtsp|udp] [--rtsp-url URL] [--rtsp-transport tcp|udp] [--rtsp-latency-ms 200] [--camera-codec h264|h265] [--udp-port 5000] [--clip-frames 150] [--max-buffered-frames 300] [--fps 10] [--output output_cascaded.mp4]\n", program);
+    printf("Usage: %s <yolo_model> <retina_model> [--source rtsp|udp] [--rtsp-url URL] [--rtsp-transport tcp|udp] [--rtsp-latency-ms 200] [--camera-codec h264|h265] [--udp-port 5000] [--clip-frames 150] [--max-buffered-frames 300] [--fps 25] [--output output_cascaded.mp4] [--yolo-workers 1] [--retina-workers 1] [--max-yolo-queue 1] [--max-retina-queue 2] [--yolo-interval 1] [--min-retina-crop 64] [--max-retina-crops 4]\n", program);
 }
 
 static bool parse_config(int argc, char **argv, AppConfig *config)
@@ -295,6 +416,34 @@ static bool parse_config(int argc, char **argv, AppConfig *config)
             }
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             config->output_path = argv[++i];
+        } else if (strcmp(argv[i], "--yolo-workers") == 0 && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], &config->yolo_worker_count)) {
+                return false;
+            }
+        } else if (strcmp(argv[i], "--retina-workers") == 0 && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], &config->retina_worker_count)) {
+                return false;
+            }
+        } else if (strcmp(argv[i], "--max-yolo-queue") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], &config->max_yolo_queue_size)) {
+                return false;
+            }
+        } else if (strcmp(argv[i], "--max-retina-queue") == 0 && i + 1 < argc) {
+            if (!parse_size_arg(argv[++i], &config->max_retina_queue_size)) {
+                return false;
+            }
+        } else if (strcmp(argv[i], "--yolo-interval") == 0 && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], &config->yolo_interval)) {
+                return false;
+            }
+        } else if (strcmp(argv[i], "--min-retina-crop") == 0 && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], &config->min_retina_crop_size)) {
+                return false;
+            }
+        } else if (strcmp(argv[i], "--max-retina-crops") == 0 && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], &config->max_retina_crops)) {
+                return false;
+            }
         } else {
             return false;
         }
@@ -345,7 +494,40 @@ static bool parse_config(int argc, char **argv, AppConfig *config)
         printf("--output must not be empty\n");
         return false;
     }
+    if (config->yolo_worker_count <= 0) {
+        printf("--yolo-workers must be greater than 0\n");
+        return false;
+    }
+    if (config->retina_worker_count <= 0) {
+        printf("--retina-workers must be greater than 0\n");
+        return false;
+    }
+    if (config->max_yolo_queue_size == 0) {
+        printf("--max-yolo-queue must be greater than 0\n");
+        return false;
+    }
+    if (config->max_retina_queue_size == 0) {
+        printf("--max-retina-queue must be greater than 0\n");
+        return false;
+    }
+    if (config->yolo_interval <= 0) {
+        printf("--yolo-interval must be greater than 0\n");
+        return false;
+    }
+    if (config->min_retina_crop_size < 0) {
+        printf("--min-retina-crop must be >= 0\n");
+        return false;
+    }
+    if (config->max_retina_crops < 0) {
+        printf("--max-retina-crops must be >= 0\n");
+        return false;
+    }
     return true;
+}
+
+static std::string decode_output_queue()
+{
+    return " ! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0";
 }
 
 static std::string build_input_pipeline(const AppConfig &config)
@@ -360,13 +542,19 @@ static std::string build_input_pipeline(const AppConfig &config)
     if (config.source == "udp") {
         return "udpsrc port=" + std::to_string(config.udp_port) +
                " caps=\"video/mpegts, systemstream=(boolean)true, packetsize=(int)188\""
-               " ! tsdemux ! " + parse + " ! mppvideodec ! videoconvert ! video/x-raw,format=BGR"
+               " ! tsdemux"
+               " ! " + parse +
+               " ! mppvideodec" + decode_output_queue() +
+               " ! videoconvert ! video/x-raw,format=BGR"
                " ! appsink drop=true max-buffers=1 sync=false";
     }
 
     return "rtspsrc location=\"" + config.rtsp_url + "\" latency=" + std::to_string(config.rtsp_latency_ms) +
-           " protocols=" + config.rtsp_transport +
-           " ! " + depay + " ! " + parse + " ! mppvideodec ! videoconvert ! video/x-raw,format=BGR"
+           " drop-on-latency=true protocols=" + config.rtsp_transport +
+           " ! " + depay +
+           " ! " + parse +
+           " ! mppvideodec" + decode_output_queue() +
+           " ! videoconvert ! video/x-raw,format=BGR"
            " ! appsink drop=true max-buffers=1 sync=false";
 }
 
@@ -464,6 +652,8 @@ static void yolo_worker(rknn_app_context_t *yolo_ctx,
                         std::atomic<bool> *stop_requested,
                         RecorderBuffer *recorder,
                         size_t max_retina_queue_size,
+                        DetectionCache *detection_cache,
+                        RuntimeStats *stats,
                         int worker_id)
 {
     while (true) {
@@ -515,15 +705,18 @@ static void yolo_worker(rknn_app_context_t *yolo_ctx,
         }
 
         packet.has_yolo = true;
+        detection_cache->update(packet.od_results);
+        stats->yolo_processed.fetch_add(1);
         log_stage_time(LOG_BLUE, "yolo-prep", packet.seq, worker_id, worker_id, yolo_prep_ms);
         log_stage_time(LOG_GREEN, "yolo-npu", packet.seq, worker_id, worker_id, yolo_npu_ms);
 
         {
             std::unique_lock<std::mutex> lock(*queue_mutex);
-            if (retina_queue->size() >= max_retina_queue_size) {
+            while (retina_queue->size() >= max_retina_queue_size) {
                 FramePacket dropped = std::move(retina_queue->front());
                 retina_queue->pop_front();
                 recorder->mark_dropped(dropped.seq);
+                stats->retina_queue_drops.fetch_add(1);
                 printf("%s[drop][worker-%d][frame-%zu] retina backlog full, dropping oldest frame%s\n",
                        LOG_YELLOW, worker_id, dropped.seq, LOG_RESET);
             }
@@ -540,6 +733,10 @@ static void retina_worker(retina_app_context_t *retina_ctx,
                           std::atomic<bool> *capture_done,
                           std::atomic<bool> *stop_requested,
                           RecorderBuffer *recorder,
+                          int min_retina_crop_size,
+                          int max_retina_crops,
+                          RuntimeStats *stats,
+                          RollingTiming *processing_timing,
                           int worker_id)
 {
     while (true) {
@@ -572,6 +769,7 @@ static void retina_worker(retina_app_context_t *retina_ctx,
         if (packet.has_yolo) {
             retina_npu_start_ms = get_current_time_ms();
             retina_draw_start_ms = 0.0;
+            int retina_crops_run = 0;
             for (int i = 0; i < packet.od_results.count; i++) {
                 object_detect_result *det_result = &(packet.od_results.results[i]);
 
@@ -584,7 +782,20 @@ static void retina_worker(retina_app_context_t *retina_ctx,
                     int crop_w = (x2 - x1) & (~15);
                     int crop_h = (y2 - y1) & (~15);
 
-                    if (crop_w > 0 && crop_h > 0) {
+                    if (crop_w <= 0 || crop_h <= 0 ||
+                        crop_w < min_retina_crop_size || crop_h < min_retina_crop_size) {
+                        stats->retina_crops_skipped_small.fetch_add(1);
+                        continue;
+                    }
+
+                    if (retina_crops_run >= max_retina_crops) {
+                        stats->retina_crops_skipped_limit.fetch_add(1);
+                        continue;
+                    }
+
+                    {
+                        retina_crops_run++;
+                        stats->retina_crops_run.fetch_add(1);
                         cv::Mat person_crop = packet.rgb_frame(cv::Rect(x1, y1, crop_w, crop_h)).clone();
 
                         image_buffer_t crop_img;
@@ -621,19 +832,7 @@ static void retina_worker(retina_app_context_t *retina_ctx,
             log_stage_time(LOG_CYAN, "retina-npu", packet.seq, worker_id, worker_id, retina_npu_ms);
 
             retina_draw_start_ms = get_current_time_ms();
-            for (int i = 0; i < packet.od_results.count; i++) {
-                object_detect_result *det_result = &(packet.od_results.results[i]);
-
-                cv::rectangle(packet.bgr_frame,
-                              cv::Point(det_result->box.left, det_result->box.top),
-                              cv::Point(det_result->box.right, det_result->box.bottom),
-                              cv::Scalar(0, 255, 0), 2);
-                char text[256];
-                sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
-                cv::putText(packet.bgr_frame, text,
-                            cv::Point(det_result->box.left, det_result->box.top - 10),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
-            }
+            draw_yolo_results(&packet.bgr_frame, packet.od_results);
         }
 
         packet.has_retina = true;
@@ -644,16 +843,90 @@ static void retina_worker(retina_app_context_t *retina_ctx,
         }
 
         double end_to_end_ms = 0.0;
-        if (packet.source_read_start_ms > 0.0) {
-            end_to_end_ms = get_current_time_ms() - packet.source_read_start_ms;
+        if (packet.processing_start_ms > 0.0) {
+            end_to_end_ms = get_current_time_ms() - packet.processing_start_ms;
+            processing_timing->add(end_to_end_ms);
             log_stage_time(LOG_YELLOW, "e2e", packet.seq, worker_id, worker_id, end_to_end_ms);
         }
 
         {
             recorder->add_completed(packet.seq, std::move(packet.bgr_frame));
+            stats->processed_frames.fetch_add(1);
         }
         queue_cv->notify_all();
     }
+}
+
+static rknn_core_mask npu_core_mask_for_worker(bool is_yolo,
+                                               int worker_id,
+                                               int yolo_worker_count,
+                                               int retina_worker_count)
+{
+    if (yolo_worker_count == 1 && retina_worker_count == 1) {
+        return is_yolo ? RKNN_NPU_CORE_0_1 : RKNN_NPU_CORE_2;
+    }
+
+    const rknn_core_mask single_core_masks[3] = {
+        RKNN_NPU_CORE_0,
+        RKNN_NPU_CORE_1,
+        RKNN_NPU_CORE_2,
+    };
+    int slot = is_yolo ? worker_id : yolo_worker_count + worker_id;
+    return single_core_masks[slot % 3];
+}
+
+static int npu_core_count(rknn_core_mask mask)
+{
+    int count = 0;
+    if (mask & RKNN_NPU_CORE_0) {
+        count++;
+    }
+    if (mask & RKNN_NPU_CORE_1) {
+        count++;
+    }
+    if (mask & RKNN_NPU_CORE_2) {
+        count++;
+    }
+    return std::max(1, count);
+}
+
+static void print_rolling_summary(size_t captured_frames,
+                                  double run_start_ms,
+                                  const RuntimeStats &stats,
+                                  RollingTiming *capture_wait_timing,
+                                  RollingTiming *capture_interval_timing,
+                                  RollingTiming *processing_timing)
+{
+    double elapsed_ms = get_current_time_ms() - run_start_ms;
+    double elapsed_s = elapsed_ms / 1000.0;
+    if (elapsed_s <= 0.0) {
+        elapsed_s = 1e-6;
+    }
+
+    TimingSnapshot capture_wait = capture_wait_timing->snapshot();
+    TimingSnapshot capture_interval = capture_interval_timing->snapshot();
+    TimingSnapshot processing = processing_timing->snapshot();
+
+    printf("%s[rolling] captured=%zu captured_fps=%.2f processed=%zu processed_fps=%.2f yolo=%zu yolo_drops=%zu retina_drops=%zu interval_reuse=%zu capture_wait(avg/p50/p95)=%.2f/%.2f/%.2f ms capture_interval(avg/p50/p95)=%.2f/%.2f/%.2f ms e2e(avg/p50/p95)=%.2f/%.2f/%.2f ms%s\n",
+           LOG_CYAN,
+           captured_frames,
+           captured_frames / elapsed_s,
+           stats.processed_frames.load(),
+           stats.processed_frames.load() / elapsed_s,
+           stats.yolo_processed.load(),
+           stats.yolo_queue_drops.load(),
+           stats.retina_queue_drops.load(),
+           stats.interval_reuse_frames.load(),
+           capture_wait.avg_ms,
+           capture_wait.p50_ms,
+           capture_wait.p95_ms,
+           capture_interval.avg_ms,
+           capture_interval.p50_ms,
+           capture_interval.p95_ms,
+           processing.avg_ms,
+           processing.p50_ms,
+           processing.p95_ms,
+           LOG_RESET);
 }
 
 int main(int argc, char **argv)
@@ -685,16 +958,17 @@ int main(int argc, char **argv)
     std::atomic<bool> capture_done(false);
     std::atomic<bool> stop_requested(false);
     std::atomic<int> save_requests(0);
-    const size_t max_yolo_queue_size = 4;
-    const size_t max_retina_queue_size = 8;
-    const int yolo_worker_count = 3;
-    const int retina_worker_count = 3;
-    const size_t max_reorder_pending = max_retina_queue_size + retina_worker_count + 8;
+    RuntimeStats stats;
+    DetectionCache detection_cache;
+    RollingTiming capture_wait_timing;
+    RollingTiming capture_interval_timing;
+    RollingTiming processing_timing;
+    const size_t max_reorder_pending = config.max_retina_queue_size + config.retina_worker_count + 8;
     RecorderBuffer recorder(config.max_buffered_frames, max_reorder_pending);
 
-    std::vector<rknn_app_context_t> yolo_contexts(yolo_worker_count);
-    std::vector<retina_app_context_t> retina_contexts(retina_worker_count);
-    for (int i = 0; i < yolo_worker_count; ++i) {
+    std::vector<rknn_app_context_t> yolo_contexts(config.yolo_worker_count);
+    std::vector<retina_app_context_t> retina_contexts(config.retina_worker_count);
+    for (int i = 0; i < config.yolo_worker_count; ++i) {
         memset(&yolo_contexts[i], 0, sizeof(rknn_app_context_t));
         ret = init_yolo11_model(yolo_path, &yolo_contexts[i]);
         if (ret != 0) {
@@ -703,17 +977,18 @@ int main(int argc, char **argv)
             }
             return -1;
         }
-        rknn_set_core_mask(yolo_contexts[i].rknn_ctx, RKNN_NPU_CORE_0_1_2);
-        ret = rknn_set_batch_core_num(yolo_contexts[i].rknn_ctx, 3);
+        rknn_core_mask core_mask = npu_core_mask_for_worker(true, i, config.yolo_worker_count, config.retina_worker_count);
+        rknn_set_core_mask(yolo_contexts[i].rknn_ctx, core_mask);
+        ret = rknn_set_batch_core_num(yolo_contexts[i].rknn_ctx, npu_core_count(core_mask));
         if (ret != RKNN_SUCC) {
             printf("rknn_set_batch_core_num(yolo-%d) fail! ret=%d\n", i, ret);
         }
     }
-    for (int i = 0; i < retina_worker_count; ++i) {
+    for (int i = 0; i < config.retina_worker_count; ++i) {
         memset(&retina_contexts[i], 0, sizeof(retina_app_context_t));
         ret = init_retinaface_model(retina_path, &retina_contexts[i]);
         if (ret != 0) {
-            for (int j = 0; j < yolo_worker_count; ++j) {
+            for (int j = 0; j < config.yolo_worker_count; ++j) {
                 release_yolo11_model(&yolo_contexts[j]);
             }
             for (int j = 0; j < i; ++j) {
@@ -721,8 +996,9 @@ int main(int argc, char **argv)
             }
             return -1;
         }
-        rknn_set_core_mask(retina_contexts[i].rknn_ctx, RKNN_NPU_CORE_0_1_2);
-        ret = rknn_set_batch_core_num(retina_contexts[i].rknn_ctx, 3);
+        rknn_core_mask core_mask = npu_core_mask_for_worker(false, i, config.yolo_worker_count, config.retina_worker_count);
+        rknn_set_core_mask(retina_contexts[i].rknn_ctx, core_mask);
+        ret = rknn_set_batch_core_num(retina_contexts[i].rknn_ctx, npu_core_count(core_mask));
         if (ret != RKNN_SUCC) {
             printf("rknn_set_batch_core_num(retina-%d) fail! ret=%d\n", i, ret);
         }
@@ -730,9 +1006,9 @@ int main(int argc, char **argv)
 
     std::vector<std::thread> yolo_threads;
     std::vector<std::thread> retina_threads;
-    yolo_threads.reserve(yolo_worker_count);
-    retina_threads.reserve(retina_worker_count);
-    for (int i = 0; i < yolo_worker_count; ++i) {
+    yolo_threads.reserve(config.yolo_worker_count);
+    retina_threads.reserve(config.retina_worker_count);
+    for (int i = 0; i < config.yolo_worker_count; ++i) {
         yolo_threads.emplace_back(yolo_worker,
                                   &yolo_contexts[i],
                                   &yolo_queue,
@@ -742,10 +1018,12 @@ int main(int argc, char **argv)
                                   &capture_done,
                                   &stop_requested,
                                   &recorder,
-                                  max_retina_queue_size,
+                                  config.max_retina_queue_size,
+                                  &detection_cache,
+                                  &stats,
                                   i);
     }
-    for (int i = 0; i < retina_worker_count; ++i) {
+    for (int i = 0; i < config.retina_worker_count; ++i) {
         retina_threads.emplace_back(retina_worker,
                                     &retina_contexts[i],
                                     &retina_queue,
@@ -754,6 +1032,10 @@ int main(int argc, char **argv)
                                     &capture_done,
                                     &stop_requested,
                                     &recorder,
+                                    config.min_retina_crop_size,
+                                    config.max_retina_crops,
+                                    &stats,
+                                    &processing_timing,
                                     i);
     }
 
@@ -763,13 +1045,20 @@ int main(int argc, char **argv)
     size_t frame_count = 0;
 
     printf("--- Starting Live %s Cascaded Inference Loop ---\n", config.source.c_str());
-    printf("source=%s codec=%s rtsp_transport=%s rtsp_latency_ms=%d udp_port=%d clip_frames=%zu max_buffered_frames=%zu fps=%.2f output=%s\n",
+    printf("source=%s codec=%s rtsp_transport=%s rtsp_latency_ms=%d udp_port=%d clip_frames=%zu max_buffered_frames=%zu fps=%.2f output=%s yolo_workers=%d retina_workers=%d max_yolo_queue=%zu max_retina_queue=%zu yolo_interval=%d min_retina_crop=%d max_retina_crops=%d\n",
            config.source.c_str(), config.camera_codec.c_str(), config.rtsp_transport.c_str(),
            config.rtsp_latency_ms, config.udp_port,
            config.clip_frames, config.max_buffered_frames,
-           config.output_fps, config.output_path.c_str());
+           config.output_fps, config.output_path.c_str(),
+           config.yolo_worker_count, config.retina_worker_count,
+           config.max_yolo_queue_size, config.max_retina_queue_size,
+           config.yolo_interval, config.min_retina_crop_size,
+           config.max_retina_crops);
 
-    double source_read_total_ms = 0.0;
+    double run_start_ms = get_current_time_ms();
+    double last_capture_success_ms = 0.0;
+    double capture_wait_total_ms = 0.0;
+    double capture_interval_total_ms = 0.0;
     double clone_total_ms = 0.0;
     while (true) {
         if (stop_requested.load()) {
@@ -782,30 +1071,64 @@ int main(int argc, char **argv)
             write_clip_mp4(frames, config.output_path, config.output_fps);
         }
 
-        double source_read_start_ms = get_current_time_ms();
+        double capture_wait_start_ms = get_current_time_ms();
         if (!cap.read(bgr_frame)) {
             printf("%s[capture] failed to read live frame; exiting%s\n", LOG_RED, LOG_RESET);
             break;
         }
-        double source_read_ms = get_current_time_ms() - source_read_start_ms;
-        source_read_total_ms += source_read_ms;
-        log_stage_time(LOG_RED, "source-read", frame_count, 0, 0, source_read_ms);
+        double capture_ready_ms = get_current_time_ms();
+        double capture_wait_ms = capture_ready_ms - capture_wait_start_ms;
+        capture_wait_total_ms += capture_wait_ms;
+        capture_wait_timing.add(capture_wait_ms);
+        log_stage_time(LOG_RED, "capture-wait", frame_count, 0, 0, capture_wait_ms);
+
+        if (last_capture_success_ms > 0.0) {
+            double capture_interval_ms = capture_ready_ms - last_capture_success_ms;
+            capture_interval_total_ms += capture_interval_ms;
+            capture_interval_timing.add(capture_interval_ms);
+            log_stage_time(LOG_CYAN, "capture-interval", frame_count, 0, 0, capture_interval_ms);
+        }
+        last_capture_success_ms = capture_ready_ms;
 
         double clone_start_ms = get_current_time_ms();
         FramePacket packet;
         packet.seq = frame_count;
-        packet.source_read_start_ms = source_read_start_ms;
+        packet.processing_start_ms = capture_ready_ms;
         packet.bgr_frame = bgr_frame.clone();
         double clone_ms = get_current_time_ms() - clone_start_ms;
         clone_total_ms += clone_ms;
         log_stage_time(LOG_BLUE, "capture-clone", packet.seq, 0, 0, clone_ms);
 
+        if (config.yolo_interval > 1 && (frame_count % config.yolo_interval) != 0) {
+            object_detect_result_list cached_results;
+            if (detection_cache.snapshot(&cached_results)) {
+                draw_yolo_results(&packet.bgr_frame, cached_results);
+            }
+            recorder.add_completed(packet.seq, std::move(packet.bgr_frame));
+            stats.interval_reuse_frames.fetch_add(1);
+            stats.processed_frames.fetch_add(1);
+            double end_to_end_ms = get_current_time_ms() - packet.processing_start_ms;
+            processing_timing.add(end_to_end_ms);
+            log_stage_time(LOG_YELLOW, "e2e", packet.seq, 0, 0, end_to_end_ms);
+            frame_count++;
+            if (frame_count % 100 == 0) {
+                print_rolling_summary(frame_count,
+                                      run_start_ms,
+                                      stats,
+                                      &capture_wait_timing,
+                                      &capture_interval_timing,
+                                      &processing_timing);
+            }
+            continue;
+        }
+
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
-            if (yolo_queue.size() >= max_yolo_queue_size) {
+            while (yolo_queue.size() >= config.max_yolo_queue_size) {
                 FramePacket dropped = std::move(yolo_queue.front());
                 yolo_queue.pop_front();
                 recorder.mark_dropped(dropped.seq);
+                stats.yolo_queue_drops.fetch_add(1);
                 printf("%s[drop][capture][frame-%zu] yolo backlog full, dropping oldest frame%s\n",
                        LOG_YELLOW, dropped.seq, LOG_RESET);
             }
@@ -813,6 +1136,14 @@ int main(int argc, char **argv)
         }
         queue_cv.notify_all();
         frame_count++;
+        if (frame_count % 100 == 0) {
+            print_rolling_summary(frame_count,
+                                  run_start_ms,
+                                  stats,
+                                  &capture_wait_timing,
+                                  &capture_interval_timing,
+                                  &processing_timing);
+        }
     }
 
     capture_done.store(true);
@@ -839,17 +1170,43 @@ int main(int argc, char **argv)
         }
     }
 
-    for (int i = 0; i < yolo_worker_count; ++i) {
+    for (int i = 0; i < config.yolo_worker_count; ++i) {
         release_yolo11_model(&yolo_contexts[i]);
     }
-    for (int i = 0; i < retina_worker_count; ++i) {
+    for (int i = 0; i < config.retina_worker_count; ++i) {
         release_retinaface_model(&retina_contexts[i]);
     }
 
     cap.release();
     deinit_post_process();
-    printf("%s[summary] captured=%zu buffered=%zu source_read=%.2f ms clone=%.2f ms%s\n",
-           LOG_CYAN, frame_count, recorder.buffered_count(), source_read_total_ms, clone_total_ms, LOG_RESET);
+    TimingSnapshot capture_wait = capture_wait_timing.snapshot();
+    TimingSnapshot capture_interval = capture_interval_timing.snapshot();
+    TimingSnapshot processing = processing_timing.snapshot();
+    printf("%s[summary] captured=%zu yolo_processed=%zu processed=%zu buffered=%zu yolo_drops=%zu retina_drops=%zu interval_reuse=%zu retina_crops=%zu retina_small_skips=%zu retina_limit_skips=%zu capture_wait_total=%.2f ms capture_interval_total=%.2f ms clone=%.2f ms capture_wait(avg/p50/p95)=%.2f/%.2f/%.2f ms capture_interval(avg/p50/p95)=%.2f/%.2f/%.2f ms e2e(avg/p50/p95)=%.2f/%.2f/%.2f ms%s\n",
+           LOG_CYAN,
+           frame_count,
+           stats.yolo_processed.load(),
+           stats.processed_frames.load(),
+           recorder.buffered_count(),
+           stats.yolo_queue_drops.load(),
+           stats.retina_queue_drops.load(),
+           stats.interval_reuse_frames.load(),
+           stats.retina_crops_run.load(),
+           stats.retina_crops_skipped_small.load(),
+           stats.retina_crops_skipped_limit.load(),
+           capture_wait_total_ms,
+           capture_interval_total_ms,
+           clone_total_ms,
+           capture_wait.avg_ms,
+           capture_wait.p50_ms,
+           capture_wait.p95_ms,
+           capture_interval.avg_ms,
+           capture_interval.p50_ms,
+           capture_interval.p95_ms,
+           processing.avg_ms,
+           processing.p50_ms,
+           processing.p95_ms,
+           LOG_RESET);
     printf("Finished! Last saved clip path: '%s'\n", config.output_path.c_str());
     return 0;
 }
