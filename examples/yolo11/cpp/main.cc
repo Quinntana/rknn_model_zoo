@@ -67,6 +67,7 @@ struct AppConfig {
     int yolo_interval = 1;
     int min_retina_crop_size = 64;
     int max_retina_crops = 4;
+    int videoconvert_threads = 4;
 };
 
 struct FramePacket {
@@ -372,7 +373,7 @@ static bool parse_double_arg(const char *value, double *out)
 
 static void print_usage(const char *program)
 {
-    printf("Usage: %s <yolo_model> <retina_model> [--source rtsp|udp] [--rtsp-url URL] [--rtsp-transport tcp|udp] [--rtsp-latency-ms 200] [--camera-codec h264|h265] [--udp-port 5000] [--clip-frames 150] [--max-buffered-frames 300] [--fps 25] [--output output_cascaded.mp4] [--yolo-workers 1] [--retina-workers 1] [--max-yolo-queue 1] [--max-retina-queue 2] [--yolo-interval 1] [--min-retina-crop 64] [--max-retina-crops 4]\n", program);
+    printf("Usage: %s <yolo_model> <retina_model> [--source rtsp|udp] [--rtsp-url URL] [--rtsp-transport tcp|udp] [--rtsp-latency-ms 200] [--camera-codec h264|h265] [--udp-port 5000] [--clip-frames 150] [--max-buffered-frames 300] [--fps 25] [--output output_cascaded.mp4] [--yolo-workers 1] [--retina-workers 1] [--max-yolo-queue 1] [--max-retina-queue 2] [--yolo-interval 1] [--min-retina-crop 64] [--max-retina-crops 4] [--videoconvert-threads 4]\n", program);
 }
 
 static bool parse_config(int argc, char **argv, AppConfig *config)
@@ -442,6 +443,10 @@ static bool parse_config(int argc, char **argv, AppConfig *config)
             }
         } else if (strcmp(argv[i], "--max-retina-crops") == 0 && i + 1 < argc) {
             if (!parse_int_arg(argv[++i], &config->max_retina_crops)) {
+                return false;
+            }
+        } else if (strcmp(argv[i], "--videoconvert-threads") == 0 && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], &config->videoconvert_threads)) {
                 return false;
             }
         } else {
@@ -522,12 +527,22 @@ static bool parse_config(int argc, char **argv, AppConfig *config)
         printf("--max-retina-crops must be >= 0\n");
         return false;
     }
+    if (config->videoconvert_threads <= 0) {
+        printf("--videoconvert-threads must be greater than 0\n");
+        return false;
+    }
     return true;
 }
 
 static std::string decode_output_queue()
 {
     return " ! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0";
+}
+
+static std::string bgr_convert(const AppConfig &config)
+{
+    return " ! videoconvert n-threads=" + std::to_string(config.videoconvert_threads) +
+           " dither=none ! video/x-raw,format=BGR";
 }
 
 static std::string build_input_pipeline(const AppConfig &config)
@@ -545,7 +560,7 @@ static std::string build_input_pipeline(const AppConfig &config)
                " ! tsdemux"
                " ! " + parse +
                " ! mppvideodec" + decode_output_queue() +
-               " ! videoconvert ! video/x-raw,format=BGR"
+               bgr_convert(config) +
                " ! appsink drop=true max-buffers=1 sync=false";
     }
 
@@ -554,7 +569,7 @@ static std::string build_input_pipeline(const AppConfig &config)
            " ! " + depay +
            " ! " + parse +
            " ! mppvideodec" + decode_output_queue() +
-           " ! videoconvert ! video/x-raw,format=BGR"
+           bgr_convert(config) +
            " ! appsink drop=true max-buffers=1 sync=false";
 }
 
@@ -1045,7 +1060,7 @@ int main(int argc, char **argv)
     size_t frame_count = 0;
 
     printf("--- Starting Live %s Cascaded Inference Loop ---\n", config.source.c_str());
-    printf("source=%s codec=%s rtsp_transport=%s rtsp_latency_ms=%d udp_port=%d clip_frames=%zu max_buffered_frames=%zu fps=%.2f output=%s yolo_workers=%d retina_workers=%d max_yolo_queue=%zu max_retina_queue=%zu yolo_interval=%d min_retina_crop=%d max_retina_crops=%d\n",
+    printf("source=%s codec=%s rtsp_transport=%s rtsp_latency_ms=%d udp_port=%d clip_frames=%zu max_buffered_frames=%zu fps=%.2f output=%s yolo_workers=%d retina_workers=%d max_yolo_queue=%zu max_retina_queue=%zu yolo_interval=%d min_retina_crop=%d max_retina_crops=%d videoconvert_threads=%d\n",
            config.source.c_str(), config.camera_codec.c_str(), config.rtsp_transport.c_str(),
            config.rtsp_latency_ms, config.udp_port,
            config.clip_frames, config.max_buffered_frames,
@@ -1053,7 +1068,7 @@ int main(int argc, char **argv)
            config.yolo_worker_count, config.retina_worker_count,
            config.max_yolo_queue_size, config.max_retina_queue_size,
            config.yolo_interval, config.min_retina_crop_size,
-           config.max_retina_crops);
+           config.max_retina_crops, config.videoconvert_threads);
 
     double run_start_ms = get_current_time_ms();
     double last_capture_success_ms = 0.0;
