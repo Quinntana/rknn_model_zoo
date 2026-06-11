@@ -30,6 +30,12 @@ struct AppConfig {
     std::string npu_core_mode = "balanced";
     bool rknn_perf = false;
     bool async_retina = false;
+    bool stream_enabled = false;
+    int stream_port = 8554;
+    std::string stream_path = "/ai";
+    double stream_fps = 15.0;
+    int stream_bitrate_kbps = 2500;
+    std::string stream_encoder = "auto";
 };
 
 void print_usage(const char *program);

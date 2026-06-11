@@ -15,6 +15,7 @@
 #include <opencv2/videoio.hpp>
 
 #include "app_config.h"
+#include "live_streamer.h"
 #include "retinaface.h"
 #include "runtime_state.h"
 #include "worker_threads.h"
@@ -63,6 +64,7 @@ int main(int argc, char **argv)
     RollingTiming retina_rknn_perf_timing;
     const size_t max_reorder_pending = config.max_retina_queue_size + config.retina_worker_count + 8;
     RecorderBuffer recorder(config.max_buffered_frames, max_reorder_pending);
+    LiveStreamer live_streamer(config);
     uint32_t rknn_init_flags = RKNN_FLAG_ENABLE_SRAM;
     if (config.rknn_perf) {
         rknn_init_flags |= RKNN_FLAG_COLLECT_PERF_MASK;
@@ -118,6 +120,7 @@ int main(int argc, char **argv)
                                   &capture_done,
                                   &stop_requested,
                                   &recorder,
+                                  &live_streamer,
                                   config.max_retina_queue_size,
                                   &detection_cache,
                                   &retina_overlay_cache,
@@ -140,6 +143,7 @@ int main(int argc, char **argv)
                                     &capture_done,
                                     &stop_requested,
                                     &recorder,
+                                    &live_streamer,
                                     &retina_overlay_cache,
                                     config.min_retina_crop_size,
                                     config.max_retina_crops,
@@ -158,7 +162,7 @@ int main(int argc, char **argv)
     size_t frame_count = 0;
 
     printf("--- Starting Live %s Cascaded Inference Loop ---\n", config.source.c_str());
-    printf("source=%s codec=%s rtsp_transport=%s rtsp_latency_ms=%d udp_port=%d clip_frames=%zu max_buffered_frames=%zu fps=%.2f output=%s yolo_workers=%d retina_workers=%d max_yolo_queue=%zu max_retina_queue=%zu yolo_interval=%d retina_reinfer_interval=%d min_retina_crop=%d max_retina_crops=%d videoconvert_threads=%d npu_core_mode=%s rknn_perf=%d async_retina=%d\n",
+    printf("source=%s codec=%s rtsp_transport=%s rtsp_latency_ms=%d udp_port=%d clip_frames=%zu max_buffered_frames=%zu fps=%.2f output=%s yolo_workers=%d retina_workers=%d max_yolo_queue=%zu max_retina_queue=%zu yolo_interval=%d retina_reinfer_interval=%d min_retina_crop=%d max_retina_crops=%d videoconvert_threads=%d npu_core_mode=%s rknn_perf=%d async_retina=%d serve_rtsp=%d stream_port=%d stream_path=%s stream_fps=%.2f stream_bitrate_kbps=%d stream_encoder=%s\n",
            config.source.c_str(), config.camera_codec.c_str(), config.rtsp_transport.c_str(),
            config.rtsp_latency_ms, config.udp_port,
            config.clip_frames, config.max_buffered_frames,
@@ -168,7 +172,9 @@ int main(int argc, char **argv)
            config.yolo_interval, config.retina_reinfer_interval,
            config.min_retina_crop_size,
            config.max_retina_crops, config.videoconvert_threads,
-           config.npu_core_mode.c_str(), config.rknn_perf ? 1 : 0, config.async_retina ? 1 : 0);
+           config.npu_core_mode.c_str(), config.rknn_perf ? 1 : 0, config.async_retina ? 1 : 0,
+           config.stream_enabled ? 1 : 0, config.stream_port, config.stream_path.c_str(),
+           config.stream_fps, config.stream_bitrate_kbps, config.stream_encoder.c_str());
 
     double run_start_ms = get_current_time_ms();
     double last_capture_success_ms = 0.0;
@@ -223,6 +229,7 @@ int main(int argc, char **argv)
             stats.interval_reuse_frames.fetch_add(1);
             complete_frame(&packet,
                            &recorder,
+                           &live_streamer,
                            &stats,
                            &processing_timing,
                            &queue_cv,
@@ -303,6 +310,7 @@ int main(int argc, char **argv)
             thread.join();
         }
     }
+    live_streamer.stop();
 
     for (int i = 0; i < config.yolo_worker_count; ++i) {
         release_yolo11_model(&yolo_contexts[i]);

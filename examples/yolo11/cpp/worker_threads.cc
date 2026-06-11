@@ -15,6 +15,7 @@
 #include <opencv2/videoio.hpp>
 
 #include "image_utils.h"
+#include "live_streamer.h"
 
 class TerminalModeGuard {
 public:
@@ -144,6 +145,7 @@ void input_worker(std::atomic<bool> *stop_requested,
 
 void complete_frame(FramePacket *packet,
                     RecorderBuffer *recorder,
+                    LiveStreamer *live_streamer,
                     RuntimeStats *stats,
                     RollingTiming *processing_timing,
                     std::condition_variable *queue_cv,
@@ -166,6 +168,9 @@ void complete_frame(FramePacket *packet,
         log_stage_time(color, "e2e", packet->seq, worker_id, ctx_id, end_to_end_ms);
     }
 
+    if (live_streamer != NULL) {
+        live_streamer->publish(packet->bgr_frame);
+    }
     recorder->add_completed(packet->seq, std::move(packet->bgr_frame));
     stats->processed_frames.fetch_add(1);
     queue_cv->notify_all();
@@ -179,6 +184,7 @@ void yolo_worker(rknn_app_context_t *yolo_ctx,
                  std::atomic<bool> *capture_done,
                  std::atomic<bool> *stop_requested,
                  RecorderBuffer *recorder,
+                 LiveStreamer *live_streamer,
                  size_t max_retina_queue_size,
                  DetectionCache *detection_cache,
                  RetinaOverlayCache *retina_overlay_cache,
@@ -266,6 +272,7 @@ void yolo_worker(rknn_app_context_t *yolo_ctx,
             output_packet.has_yolo = true;
             complete_frame(&output_packet,
                            recorder,
+                           live_streamer,
                            stats,
                            processing_timing,
                            queue_cv,
@@ -282,6 +289,7 @@ void yolo_worker(rknn_app_context_t *yolo_ctx,
             if (!async_retina) {
                 complete_frame(&packet,
                                recorder,
+                               live_streamer,
                                stats,
                                processing_timing,
                                queue_cv,
@@ -318,6 +326,7 @@ void retina_worker(retina_app_context_t *retina_ctx,
                    std::atomic<bool> *capture_done,
                    std::atomic<bool> *stop_requested,
                    RecorderBuffer *recorder,
+                   LiveStreamer *live_streamer,
                    RetinaOverlayCache *retina_overlay_cache,
                    int min_retina_crop_size,
                    int max_retina_crops,
@@ -361,6 +370,7 @@ void retina_worker(retina_app_context_t *retina_ctx,
             if (packet.record_on_retina) {
                 complete_frame(&packet,
                                recorder,
+                               live_streamer,
                                stats,
                                processing_timing,
                                queue_cv,
@@ -479,6 +489,9 @@ void retina_worker(retina_app_context_t *retina_ctx,
                 log_stage_time(LOG_YELLOW, "e2e", packet.seq, worker_id, worker_id, end_to_end_ms);
             }
 
+            if (live_streamer != NULL) {
+                live_streamer->publish(packet.bgr_frame);
+            }
             recorder->add_completed(packet.seq, std::move(packet.bgr_frame));
             stats->processed_frames.fetch_add(1);
         }

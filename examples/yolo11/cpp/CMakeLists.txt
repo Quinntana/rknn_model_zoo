@@ -4,10 +4,20 @@ project(rknn_yolo11_demo)
 
 # === NEW: FIND OPENCV IN THE SYSTEM ===
 find_package(OpenCV REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GSTREAMER_RTSP REQUIRED IMPORTED_TARGET
+    gstreamer-1.0
+    gstreamer-app-1.0
+    gstreamer-rtsp-server-1.0
+)
 message(STATUS "OpenCV library status:")
 message(STATUS "    version: ${OpenCV_VERSION}")
 message(STATUS "    libraries: ${OpenCV_LIBS}")
 message(STATUS "    include path: ${OpenCV_INCLUDE_DIRS}")
+message(STATUS "GStreamer RTSP library status:")
+message(STATUS "    version: ${GSTREAMER_RTSP_VERSION}")
+message(STATUS "    libraries: ${GSTREAMER_RTSP_LIBRARIES}")
+message(STATUS "    include path: ${GSTREAMER_RTSP_INCLUDE_DIRS}")
 
 if (ENABLE_ASAN)
 	message(STATUS "BUILD WITH ADDRESS SANITIZER")
@@ -42,6 +52,7 @@ add_executable(${PROJECT_NAME}
     app_config.cc
     runtime_state.cc
     worker_threads.cc
+    live_streamer.cc
     postprocess.cc
     retinaface.cc
     ${rknpu_yolo11_file}
@@ -53,6 +64,7 @@ target_link_libraries(${PROJECT_NAME}
     imagedrawing    
     ${LIBRKNNRT}
     ${OpenCV_LIBS} # <-- LINK OPENCV
+    PkgConfig::GSTREAMER_RTSP
     dl
 )
 
@@ -84,6 +96,7 @@ if (NOT (TARGET_SOC STREQUAL "rv1106" OR TARGET_SOC STREQUAL "rv1103" OR TARGET_
         app_config.cc
         runtime_state.cc
         worker_threads.cc
+        live_streamer.cc
         postprocess.cc
         retinaface.cc
         rknpu2/yolo11_zero_copy.cc
@@ -97,6 +110,7 @@ if (NOT (TARGET_SOC STREQUAL "rv1106" OR TARGET_SOC STREQUAL "rv1103" OR TARGET_
         imagedrawing    
         ${LIBRKNNRT}
         ${OpenCV_LIBS} # <-- LINK OPENCV
+        PkgConfig::GSTREAMER_RTSP
         dl
     )
 

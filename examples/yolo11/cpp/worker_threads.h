@@ -16,6 +16,8 @@
 #include "runtime_state.h"
 #include "yolo11.h"
 
+class LiveStreamer;
+
 bool write_clip_mp4(const std::vector<RecordedFrame> &frames, const std::string &output_path, double fps);
 
 void input_worker(std::atomic<bool> *stop_requested,
@@ -25,6 +27,7 @@ void input_worker(std::atomic<bool> *stop_requested,
 
 void complete_frame(FramePacket *packet,
                     RecorderBuffer *recorder,
+                    LiveStreamer *live_streamer,
                     RuntimeStats *stats,
                     RollingTiming *processing_timing,
                     std::condition_variable *queue_cv,
@@ -41,6 +44,7 @@ void yolo_worker(rknn_app_context_t *yolo_ctx,
                  std::atomic<bool> *capture_done,
                  std::atomic<bool> *stop_requested,
                  RecorderBuffer *recorder,
+                 LiveStreamer *live_streamer,
                  size_t max_retina_queue_size,
                  DetectionCache *detection_cache,
                  RetinaOverlayCache *retina_overlay_cache,
@@ -61,6 +65,7 @@ void retina_worker(retina_app_context_t *retina_ctx,
                    std::atomic<bool> *capture_done,
                    std::atomic<bool> *stop_requested,
                    RecorderBuffer *recorder,
+                   LiveStreamer *live_streamer,
                    RetinaOverlayCache *retina_overlay_cache,
                    int min_retina_crop_size,
                    int max_retina_crops,

@@ -45,7 +45,7 @@ static bool parse_double_arg(const char *value, double *out)
 
 void print_usage(const char *program)
 {
-    printf("Usage: %s <yolo_model> <retina_model> [--source rtsp|udp] [--rtsp-url URL] [--rtsp-transport tcp|udp] [--rtsp-latency-ms 200] [--camera-codec h264|h265] [--udp-port 5000] [--clip-frames 150] [--max-buffered-frames 300] [--fps 25] [--output output_cascaded.mp4] [--yolo-workers 1] [--retina-workers 1] [--max-yolo-queue 1] [--max-retina-queue 2] [--yolo-interval 1] [--retina-reinfer-interval 1] [--min-retina-crop 64] [--max-retina-crops 4] [--videoconvert-threads 4] [--npu-core-mode balanced|yolo-all|round-robin] [--rknn-perf] [--async-retina]\n", program);
+    printf("Usage: %s <yolo_model> <retina_model> [--source rtsp|udp] [--rtsp-url URL] [--rtsp-transport tcp|udp] [--rtsp-latency-ms 200] [--camera-codec h264|h265] [--udp-port 5000] [--clip-frames 150] [--max-buffered-frames 300] [--fps 25] [--output output_cascaded.mp4] [--yolo-workers 1] [--retina-workers 1] [--max-yolo-queue 1] [--max-retina-queue 2] [--yolo-interval 1] [--retina-reinfer-interval 1] [--min-retina-crop 64] [--max-retina-crops 4] [--videoconvert-threads 4] [--npu-core-mode balanced|yolo-all|round-robin] [--rknn-perf] [--async-retina] [--serve-rtsp] [--stream-port 8554] [--stream-path /ai] [--stream-fps 15] [--stream-bitrate-kbps 2500] [--stream-encoder auto|mpp|x264]\n", program);
 }
 
 bool parse_config(int argc, char **argv, AppConfig *config)
@@ -131,6 +131,29 @@ bool parse_config(int argc, char **argv, AppConfig *config)
             config->rknn_perf = true;
         } else if (strcmp(argv[i], "--async-retina") == 0) {
             config->async_retina = true;
+        } else if (strcmp(argv[i], "--serve-rtsp") == 0) {
+            config->stream_enabled = true;
+        } else if (strcmp(argv[i], "--stream-port") == 0 && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], &config->stream_port)) {
+                return false;
+            }
+            config->stream_enabled = true;
+        } else if (strcmp(argv[i], "--stream-path") == 0 && i + 1 < argc) {
+            config->stream_path = argv[++i];
+            config->stream_enabled = true;
+        } else if (strcmp(argv[i], "--stream-fps") == 0 && i + 1 < argc) {
+            if (!parse_double_arg(argv[++i], &config->stream_fps)) {
+                return false;
+            }
+            config->stream_enabled = true;
+        } else if (strcmp(argv[i], "--stream-bitrate-kbps") == 0 && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], &config->stream_bitrate_kbps)) {
+                return false;
+            }
+            config->stream_enabled = true;
+        } else if (strcmp(argv[i], "--stream-encoder") == 0 && i + 1 < argc) {
+            config->stream_encoder = argv[++i];
+            config->stream_enabled = true;
         } else {
             return false;
         }
@@ -222,6 +245,30 @@ bool parse_config(int argc, char **argv, AppConfig *config)
         config->npu_core_mode != "round-robin") {
         printf("--npu-core-mode must be 'balanced', 'yolo-all', or 'round-robin'\n");
         return false;
+    }
+    if (config->stream_enabled) {
+        if (config->stream_port <= 0 || config->stream_port > 65535) {
+            printf("Invalid --stream-port: %d\n", config->stream_port);
+            return false;
+        }
+        if (config->stream_path.empty()) {
+            printf("--stream-path must not be empty\n");
+            return false;
+        }
+        if (config->stream_fps <= 0.0) {
+            printf("--stream-fps must be greater than 0\n");
+            return false;
+        }
+        if (config->stream_bitrate_kbps <= 0) {
+            printf("--stream-bitrate-kbps must be greater than 0\n");
+            return false;
+        }
+        if (config->stream_encoder != "auto" &&
+            config->stream_encoder != "mpp" &&
+            config->stream_encoder != "x264") {
+            printf("--stream-encoder must be 'auto', 'mpp', or 'x264'\n");
+            return false;
+        }
     }
     return true;
 }
