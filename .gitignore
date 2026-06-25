@@ -13,6 +13,32 @@ install
 datasets/COCO/annotations/*
 datasets/COCO/val2017/*
 
+# Heavy benchmark datasets generated/downloaded locally.
+datasets/face_benchmark/
+datasets/wider_face/
+datasets/WIDER_FACE/
+datasets/CelebA-Spoof/
+datasets/celeba_spoof/
+datasets/lfw/
+datasets/scface/
+datasets/vietnamese_celeb/
+
+# Heavy generated/downloaded model artifacts. Keep source code, registries,
+# configs, and small metadata trackable; ignore binary model payloads.
+*.rknn
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.tflite
+*.caffemodel
+*.pb
+*.engine
+*.safetensors
+examples/**/model/*.npy
+examples/**/model/*.npz
+examples/**/model/logs/
+
 breakpoint_output/
 
 models/CV/body_analysis/

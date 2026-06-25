@@ -1,0 +1,90 @@
+# RKNN Face Benchmark model registry.
+#
+# Paths are resolved relative to this registry file. The build installs the
+# sample yolo11 and RetinaFace RKNN files from this repository when they exist.
+# Add your liveness and feature extraction models below using the same schema.
+
+models:
+  - classification: baseline
+    task: face_detection
+    demo: RetinaFace
+    name: RetinaFace_mobile320
+    path: model/RetinaFace.rknn
+    input_shape: [1, 3, 320, 320]
+    input_layout: nchw
+    dtype: INT8
+    color_order: rgb
+    resize: letterbox
+    output_decoder: retinaface
+    threshold: 0.5
+
+  - classification: baseline
+    task: face_detection
+    demo: yolo11
+    name: yolo11n
+    path: model/yolo11n.rknn
+    input_shape: [1, 3, 640, 640]
+    input_layout: nchw
+    dtype: INT8
+    color_order: rgb
+    resize: letterbox
+    output_decoder: unsupported
+    threshold: 0.25
+
+  - classification: baseline
+    task: face_detection
+    demo: yolo11
+    name: yolo11s
+    path: model/yolo11s.rknn
+    input_shape: [1, 3, 640, 640]
+    input_layout: nchw
+    dtype: INT8
+    color_order: rgb
+    resize: letterbox
+    output_decoder: unsupported
+    threshold: 0.25
+
+  # Example liveness entry. Uncomment and edit for your actual model.
+  # - classification: liveness check
+  #   task: liveness
+  #   demo: liveness
+  #   name: your_liveness_model
+  #   path: model/liveness.rknn
+  #   input_shape: [1, 3, 224, 224]
+  #   input_layout: nchw
+  #   dtype: INT8
+  #   color_order: rgb
+  #   resize: stretch
+  #   output_activation: softmax
+  #   positive_index: 1
+  #   threshold: 0.5
+
+  # Example feature extraction entry. Uncomment and edit for your actual model.
+  # - classification: feature extraction
+  #   task: feature_extraction
+  #   demo: face_embedding
+  #   name: your_embedding_model
+  #   path: model/feature.rknn
+  #   input_shape: [1, 3, 112, 112]
+  #   input_layout: nchw
+  #   dtype: INT8
+  #   color_order: rgb
+  #   resize: stretch
+  #   output_activation: none
+  #   output_index: 0
+  #   feature_norm: l2
+
+  - classification: feature extraction
+    task: feature_extraction
+    demo: AuraFace
+    name: AuraFace-v1-rk3588
+    path: model/auraface.rknn
+    input_shape: [1, 3, 112, 112]
+    input_layout: nchw
+    input_type: uint8
+    dtype: INT8
+    color_order: bgr
+    resize: stretch
+    output_activation: none
+    output_index: 0
+    feature_norm: l2
